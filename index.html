@@ -509,7 +509,7 @@ const {useState,useEffect,useRef}=React,e=React.createElement;
 /* ── SUPABASE CONFIG — update these 3 lines per deployment ── */
 const SUPABASE_URL='https://yhkcdycypwxzxxwaxnzj.supabase.co';
 const SUPABASE_ANON_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inloa2NkeWN5cHd4enh4d2F4bnpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzMjgxMTgsImV4cCI6MjA5MTkwNDExOH0.q9u1O_uixHxDcb8bJgPJg-CaSSPU3XNZxfqYV6YnHWE';
-const CONTRACTOR_SLUG='darby-shearing';
+const CONTRACTOR_SLUG='knights-shearing';
 
 const sb=supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
 
@@ -3568,8 +3568,8 @@ function ScheduleScreen({jobs,role,setRole,onBack,onJob,onNew,onNewDraft}){
 }
 
 /* ── APP ── */
-const CONTRACTOR_NAME='Darby Shearing';
-const CONTRACTOR_URL='https://darbyshearing.vercel.app';
+const CONTRACTOR_NAME='Knights Shearing';
+const CONTRACTOR_URL='https://knightsshearing.vercel.app';
 function App(){
   const [appUnlocked,setAppUnlocked]=useState(true);
   const [loading,setLoading]=useState(true);
