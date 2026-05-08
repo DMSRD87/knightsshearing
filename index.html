@@ -523,7 +523,7 @@ const LS_LAST_RATES='mg_last_rates_'+CONTRACTOR_SLUG;
 const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.5.3'; /* BUG FIX over v4.5.2. Date strip was frozen at daysAllocated, blocking tally entry once a shed ran over its planned days (Carriewerloo, Darby, day 8 of 10). jobDates() now extends past daysAllocated up to localToday() for Active jobs only, honoring includeWeekends. No data migration required — purely a display extension. v4.5.2 iOS Supabase upsert fix carried forward unchanged. */
+const APP_VERSION='v4.5.4'; /* BUG FIX over v4.5.3. Stale-mode autosave wipe: lead-on-iphone (poor signal → isFresh=false) typed tallies that lived only in LS_JOBS, then a goOnline / visibility_revalidate dbLoad with empty queue clobbered LS_JOBS with Supabase data and the admin on another device never saw the work. Two changes: (A) stale-mode autosave now queueWrites every job so dbLoad's merge branch protects them and flushQueue ferries them to Supabase. (B) goOnline drops its `!isFresh` force-refetch shortcut — recovery now happens via promotion after a clean flush rather than a destructive overwrite, and visibility_revalidate skips the dbLoad entirely when dirtyRef is true. Pre-save guard in dbSaveJob still protects against regressive runs maps, so multi-contractor wipe protection is preserved. No data migration. */
 const DATA_VERSION='2026-05-05-iphone-fix'; /* Bump to force one-time localStorage cache wipe on next boot, ensuring all devices start clean with the iPhone bugfix in place. */
 
 const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{return null;}};
@@ -3794,20 +3794,27 @@ function App(){
       setPendingCount(remaining);
       if(n>0){setSaveStatus('saved');setTimeout(()=>setSaveStatus(''),2500);}
       else setSaveStatus('');
-      /* Re-fetch from Supabase if:
-         (a) queue is fully clear (otherwise local has unsynced writes), AND
-         (b) either we're in stale mode (we MUST recover to fresh, even if user typed
-             something while stale — those local edits are unreliable anyway since they
-             were typed against incomplete state), OR we have no dirty React state. */
-      const shouldRefetch=remaining===0 && (!isFreshRef.current || !dirtyRef.current);
+      /* PATCH v4.5.4 — Stale device, queue just emptied: promote to fresh WITHOUT
+         a refetch. Our queued edits are now on Supabase, so React state is the
+         truth. A refetch here would overwrite any tallies the user typed during
+         the await window (mid-shed lead is highly likely to be still typing).
+         The next visibility revalidate or page load will pull other devices'
+         updates in safely. */
+      if(remaining===0 && n>0 && !isFreshRef.current){
+        setFresh(true,'goOnline_promoted_after_flush');
+        dirtyRef.current=false;
+        logSaveFailure('diag_load','goOnline_promoted','queue_emptied;promoted_without_refetch');
+      }
+      /* Re-fetch from Supabase only when (a) queue is fully clear AND (b) we have
+         no unsaved React-state edits. Removed the previous `!isFreshRef` shortcut:
+         it was forcing a refetch in stale mode regardless of dirty, which wiped
+         the user's typed tallies (lead-on-iphone losing data the admin would have
+         seen). Stale-mode recovery now happens via Fix A's queueing + the
+         promotion above, never via a destructive overwrite. */
+      const shouldRefetch=remaining===0 && !dirtyRef.current;
       if(shouldRefetch){
-        if(!isFreshRef.current){
-          logSaveFailure('diag_load','goOnline_stale_recovery','attempting_dbLoad');
-        }
         dbLoad().then(({jobs:j,farms:f,crew:c,fromCache})=>{
-          /* If we're already fresh, respect dirty check (don't overwrite user edits).
-             If we're stale, prioritise recovery — overwrite anyway. */
-          if(isFreshRef.current && dirtyRef.current)return;
+          if(dirtyRef.current)return;
           /* CRITICAL: sync globals BEFORE setting state so gf()/gc() return correct
              values during the next render. Otherwise jobs render as "Unknown". */
           syncLookups(f,c);
@@ -3872,7 +3879,22 @@ function App(){
        never be lost just because the cloud is stale. */
     try{lsSet(LS_JOBS,jobs);}catch(e){}
     if(!isFreshRef.current){
-      logSaveFailure('diag_save','autosave_blocked_stale','jobs='+jobs.length+';local_cached');
+      /* PATCH v4.5.4 — Stale-mode wipe fix.
+         Previously this returned without enqueuing, leaving the user's edits
+         in LS_JOBS only. The next dbLoad (visibility revalidate / goOnline)
+         hits its `pendingQ.length===0` branch and overwrites LS_JOBS with
+         Supabase data — wiping the lead's just-typed tallies before the admin
+         on a different device ever sees them.
+         Enqueue every job so:
+           1. dbLoad's merge branch protects these edits (queue.length>0 path).
+           2. The next online flushQueue ferries them to Supabase, making the
+              tallies visible to the admin on another device/network.
+         The pre-save guard in dbSaveJob still rejects regressive runs maps,
+         so this can't reintroduce the multi-contractor wipe bug. */
+      jobs.forEach(j=>queueWrite('job',j.id,j));
+      setPendingCount((lsGet(LS_QUEUE)||[]).length);
+      setSaveStatus(navigator.onLine?'syncing':'offline');
+      logSaveFailure('diag_save','autosave_stale_queued','jobs='+jobs.length+';queued_for_flush');
       return;
     }
     clearTimeout(saveTimer.current);
@@ -3947,22 +3969,34 @@ function App(){
       }else{
         const hiddenFor=Date.now()-lastVisibleRef.current;
         if(hiddenFor>VISIBILITY_REVALIDATE_MS){
-          /* Long hidden — invalidate freshness and force a fresh dbLoad */
-          logSaveFailure('diag_visibility','revalidate_required','hidden_ms='+hiddenFor);
-          setFresh(false,'visibility_revalidate_invalidate');
-          if(navigator.onLine){
-            dbLoad().then(({jobs:j,farms:f,crew:c,fromCache})=>{
-              if(dirtyRef.current)return;
-              syncLookups(f,c);
-              const migratedJobs=j.map(job=>migrateJobRoles(job,c));
-              /* Mark this state set as system-driven so auto-save doesn't fire on it */
-              suppressNextSaveRef.current=true;
-              setJobs(migratedJobs);setFarmList(f);setCrewList(c);
-              if(!fromCache){
-                setFresh(true,'visibility_revalidate_recovered');
-                logSaveFailure('diag_load','visibility_revalidate','fresh_after_revalidate');
-              }
-            }).catch(()=>{});
+          if(dirtyRef.current){
+            /* PATCH v4.5.4 — Skip the revalidate entirely while dirty.
+               The post-dbLoad dirty guard below was too late: dbLoad had
+               already executed `lsSet(LS_JOBS, supabaseData)` (queue empty
+               branch), wiping the lead's locally-queued tallies. The next
+               page reload (iOS killing the tab on memory pressure, BFCache
+               eviction, manual refresh) would then read the wiped LS_JOBS
+               and the lead's work would be gone before it ever synced.
+               Defer the revalidate until next time the tab returns clean. */
+            logSaveFailure('diag_visibility','revalidate_skipped_dirty','hidden_ms='+hiddenFor);
+          }else{
+            /* Long hidden — invalidate freshness and force a fresh dbLoad */
+            logSaveFailure('diag_visibility','revalidate_required','hidden_ms='+hiddenFor);
+            setFresh(false,'visibility_revalidate_invalidate');
+            if(navigator.onLine){
+              dbLoad().then(({jobs:j,farms:f,crew:c,fromCache})=>{
+                if(dirtyRef.current)return;
+                syncLookups(f,c);
+                const migratedJobs=j.map(job=>migrateJobRoles(job,c));
+                /* Mark this state set as system-driven so auto-save doesn't fire on it */
+                suppressNextSaveRef.current=true;
+                setJobs(migratedJobs);setFarmList(f);setCrewList(c);
+                if(!fromCache){
+                  setFresh(true,'visibility_revalidate_recovered');
+                  logSaveFailure('diag_load','visibility_revalidate','fresh_after_revalidate');
+                }
+              }).catch(()=>{});
+            }
           }
         }
         lastVisibleRef.current=Date.now();
