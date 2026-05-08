@@ -523,7 +523,7 @@ const LS_LAST_RATES='mg_last_rates_'+CONTRACTOR_SLUG;
 const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.5.4'; /* BUG FIX over v4.5.3. Stale-mode autosave wipe: lead-on-iphone (poor signal → isFresh=false) typed tallies that lived only in LS_JOBS, then a goOnline / visibility_revalidate dbLoad with empty queue clobbered LS_JOBS with Supabase data and the admin on another device never saw the work. Two changes: (A) stale-mode autosave now queueWrites every job so dbLoad's merge branch protects them and flushQueue ferries them to Supabase. (B) goOnline drops its `!isFresh` force-refetch shortcut — recovery now happens via promotion after a clean flush rather than a destructive overwrite, and visibility_revalidate skips the dbLoad entirely when dirtyRef is true. Pre-save guard in dbSaveJob still protects against regressive runs maps, so multi-contractor wipe protection is preserved. No data migration. */
+const APP_VERSION='v4.5.5'; /* FEATURE over v4.5.4. Auto-update detection so deployed fixes reach all devices without a manual refresh. Polls /index.html on mount, on visibilitychange-visible, on `online` event, and every 10 minutes; regex-extracts APP_VERSION; if newer, clean devices reload silently after a best-effort flushQueue, dirty devices show a tap-to-update banner so a lead mid-tally is never reloaded out from under their work. From this version forward, every future deploy auto-propagates within ~10 min of a tab being foregrounded with signal. v4.5.4 stale-mode autosave wipe fix carried forward unchanged. */
 const DATA_VERSION='2026-05-05-iphone-fix'; /* Bump to force one-time localStorage cache wipe on next boot, ensuring all devices start clean with the iPhone bugfix in place. */
 
 const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{return null;}};
@@ -3569,6 +3569,10 @@ function App(){
   const [isOnline,setIsOnline]=useState(navigator.onLine);
   const [pendingCount,setPendingCount]=useState(0);
   const [loadedFromCache,setLoadedFromCache]=useState(false);
+  /* PATCH v4.5.5 — Auto-update detection. True once a deployed version newer than
+     APP_VERSION has been fetched. UI shows a tap-to-update banner; if the user is
+     clean (no unsaved tallies) we reload silently instead. */
+  const [updateAvailable,setUpdateAvailable]=useState(false);
   /* Restore role from localStorage if within timeout */
   const [role,setRole]=useState(()=>{
     const saved=lsGet(LS_ROLE);
@@ -3838,6 +3842,76 @@ function App(){
     return()=>{window.removeEventListener('online',goOnline);window.removeEventListener('offline',goOffline);};
   },[]);
 
+  /* PATCH v4.5.5 — Auto-update polling.
+     Fetch the deployed index.html, regex out APP_VERSION, compare with this build.
+     Triggers: on mount, on visibility becoming visible, on `online` event, and every
+     10 minutes while foregrounded. If a newer version is detected:
+       - dirty (user has unsaved tallies): show a banner; user taps to flush+reload.
+       - clean: best-effort flushQueue, then location.reload() silently.
+     Never reloads while typing — dirtyRef is true the moment a keystroke is registered,
+     so the banner path catches mid-shed leads. The flushQueue before reload coordinates
+     with the v4.5.4 stale-mode queueing fix so nothing in flight is lost. */
+  useEffect(()=>{
+    let cancelled=false;
+    let inFlight=false;
+    const checkForUpdate=async()=>{
+      if(cancelled||inFlight)return;
+      if(!navigator.onLine)return;
+      inFlight=true;
+      try{
+        /* cache:'no-store' bypasses HTTP cache; the SW does network-first for
+           HTML so we still get a fresh response. Fixed URL (no cachebuster query)
+           so we don't pollute the SW cache with one-off entries. */
+        const res=await withTimeout(fetch('/',{cache:'no-store'}),5000,'version_check_timeout');
+        if(!res||!res.ok)return;
+        const html=await res.text();
+        const m=html.match(/APP_VERSION\s*=\s*['"]([^'"]+)['"]/);
+        if(!m)return;
+        const remoteVersion=m[1];
+        if(remoteVersion===APP_VERSION)return;
+        try{logSaveFailure('diag_update','detected','remote='+remoteVersion+';local='+APP_VERSION+';dirty='+dirtyRef.current);}catch(e){}
+        if(!dirtyRef.current){
+          /* Clean: flush any queued writes (defensive; queue should be empty when
+             clean in fresh mode) then reload silently. */
+          try{await flushQueue();}catch(e){}
+          location.reload();
+        }else{
+          /* Dirty: show banner. User taps to apply. */
+          setUpdateAvailable(true);
+        }
+      }catch(e){
+        /* Network blip / timeout — try again on next trigger */
+      }finally{
+        inFlight=false;
+      }
+    };
+    /* Initial check on mount */
+    checkForUpdate();
+    /* Periodic: every 10 minutes while the tab is alive */
+    const intervalId=setInterval(checkForUpdate,10*60*1000);
+    /* On tab becoming visible (PWA relaunch, app foregrounding) */
+    const onVis=()=>{if(document.visibilityState==='visible')checkForUpdate();};
+    document.addEventListener('visibilitychange',onVis);
+    /* On network reconnect — catches "shed lead got signal" moments */
+    const onOnline=()=>checkForUpdate();
+    window.addEventListener('online',onOnline);
+    return()=>{
+      cancelled=true;
+      clearInterval(intervalId);
+      document.removeEventListener('visibilitychange',onVis);
+      window.removeEventListener('online',onOnline);
+    };
+  },[]);
+
+  /* PATCH v4.5.5 — User-tap apply of a detected update.
+     Best-effort flush so queued tallies make it to Supabase before reload, then
+     reload to pick up the new HTML the SW just fetched. */
+  const applyUpdate=async()=>{
+    setSaveStatus('syncing');
+    try{await flushQueue();}catch(e){}
+    location.reload();
+  };
+
   /* Keep jobsRef in sync so async handlers can read current state synchronously */
   useEffect(()=>{jobsRef.current=jobs;},[jobs]);
 
@@ -4105,10 +4179,15 @@ function App(){
     isOnline&&!isFreshState&&isLoaded.current&&e('div',{style:{position:'fixed',top:0,left:0,right:0,zIndex:200,background:'#7c2d12',color:'#fff',fontSize:11,fontWeight:700,textAlign:'center',padding:'4px',letterSpacing:.5}},
       '⟳ Reconnecting to server — changes will save once connected'
     ),
+    /* PATCH v4.5.5 — Update-available banner. Only shown while dirty (clean devices
+       reload silently). Tap saves pending tallies then reloads onto the new build. */
+    updateAvailable&&e('div',{onClick:applyUpdate,style:{position:'fixed',top:0,left:0,right:0,zIndex:201,background:'#15803d',color:'#fff',fontSize:12,fontWeight:700,textAlign:'center',padding:'6px',letterSpacing:.5,cursor:'pointer'}},
+      '✨ New version available — tap to update'
+    ),
     sc&&e('div',{style:{position:'fixed',bottom:80,right:18,padding:'5px 12px',borderRadius:20,fontSize:11,fontWeight:700,zIndex:100,background:sc.bg,color:'#fff',boxShadow:'0 2px 8px rgba(0,0,0,.2)'}},sc.txt)
   );
 
-  return e('div',{style:{paddingTop:(!isOnline||(isOnline&&!isFreshState&&isLoaded.current))?20:0}},
+  return e('div',{style:{paddingTop:(updateAvailable||!isOnline||(isOnline&&!isFreshState&&isLoaded.current))?24:0}},
     e(StatusBar),
     screen==='home'&&e(HomeScreen,{jobs,role,setRole:persistRole,onJob:goJob,onNew:()=>setShowNew(true),onDatabase:()=>setShowDatabase(true),onSchedule:goSchedule,contractorName:CONTRACTOR_NAME}),
     screen==='schedule'&&role!=='read_only'&&e(ScheduleScreen,{jobs,role,setRole:persistRole,onBack:goHome,onJob:goJob,onNew:()=>setShowNew(true),onNewDraft:()=>setShowNew(true)}),
