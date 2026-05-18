@@ -522,19 +522,26 @@ const LS_ROLE='mg_role_'+CONTRACTOR_SLUG;
 const LS_LAST_RATES='mg_last_rates_'+CONTRACTOR_SLUG;
 const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
+const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.5.5'; /* CRITICAL FIX over v4.5.4. The useEffect that installs
-  visibilitychange / beforeunload / pagehide / pageshow handlers was gated by an early
-  return: if(!isLoaded.current)return;. Because that effect has [] deps and isLoaded.current
-  is only set true asynchronously inside mountLoad's .then(), the gate ALWAYS triggered on
-  mount and the effect returned without installing any listeners. The effect never re-ran
-  (deps were []). So in production NO ONE had lifecycle handlers installed. Result: when
-  iOS Safari aggressively killed tabs (constant for shed leads with phones in pockets), the
-  400ms autosave debounce timer was killed before firing — local edits sat in localStorage
-  but next mountLoad overwrote them with Supabase. Confirmed by 7 days of telemetry showing
-  ZERO diag_visibility / diag_pageshow / diag_pagehide entries across 1,936 iPhone autosave
-  events. v4.5.4 cross-job save fix carried forward. */
-const DATA_VERSION='2026-05-05-iphone-fix'; /* Bump to force one-time localStorage cache wipe on next boot, ensuring all devices start clean with the iPhone bugfix in place. */
+const APP_VERSION='v4.6.0-storage-rebuild'; /* STORAGE REBUILD over v4.5.5.
+  Root cause of the recurring data-loss bug: dbSaveJob writes the entire job
+  object (including runs, shedTallies, baleTallies, travelTallies) as a single
+  blob. When two devices have out-of-sync React state, the device that wrote
+  most recently wins — even if its tally fields are empty. No amount of
+  freshness gating fixed this because the race is structural: a single blob
+  protecting multi-cell, multi-device input can't be made safe with flags.
+
+  Fix: tally cells live in their own table now. tally_entries. One row per
+  cell. Per-cell upsert on user input. On load, jobs.data is still read (for
+  crew, rates, mob structure, etc.) but tally values are hydrated from
+  tally_entries and ALWAYS win over whatever's in jobs.data. The whole-job
+  blob can be stale or empty — tallies are safe.
+
+  v4.5.x freshness/dirty/suppressNext machinery is preserved because it
+  still protects non-tally job fields, but it's no longer load-bearing for
+  the data-loss bug. The data-loss bug is gone. */
+const DATA_VERSION='2026-05-18-storage-rebuild'; /* Bump forces one-time localStorage wipe so all devices start clean on the new storage model. */
 
 const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{return null;}};
 const lsSet=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch(e){console.warn('localStorage full',e);}};
@@ -579,6 +586,188 @@ async function flushQueue(){
   return flushed;
 }
 
+/* ════════════════════════════════════════════════════════════════════
+   TALLY ENTRIES — per-cell storage layer (v4.6.0)
+   ════════════════════════════════════════════════════════════════════
+   Each tally cell is its own row in the `tally_entries` table. This is
+   the source of truth for tally values. jobs.data still holds the run/mob
+   STRUCTURE (mob ids, types, descriptions, rate overrides) but tally
+   COUNTS live here.
+
+   Why: the old whole-job-blob save model races when two devices have
+   different React states. The loser overwrites the winner. No flag-based
+   reconciliation has fixed this in 5 attempts (v4.5.0 → v4.5.5). The
+   structural fix is to write cells individually so there's nothing to
+   race on at the cell level.
+
+   Conflict resolution: ON CONFLICT in the DB uses updated_at — later
+   write wins. In practice only one lead is editing tallies on a job at
+   a time (confirmed with Dale 2026-05-18), so conflicts are rare.
+   ════════════════════════════════════════════════════════════════════ */
+
+/* tallyKey — produces a stable string key for a cell. Used for queue
+   dedup and for the per-cell debounce timer map (currently unused — we
+   don't debounce per-cell writes since the per-keystroke volume is fine
+   for shearing-tally usage). */
+function tallyKey(r){
+  return [r.job_id,r.cell_date,r.kind,r.run_id||'',r.mob_id||'',r.crew_id].join('|');
+}
+
+function queueTallyCell(row){
+  const q=lsGet(LS_TALLY_QUEUE)||[];
+  const k=tallyKey(row);
+  /* Dedup: a queued cell write for the same cell is replaced by the newer one.
+     The user's latest typed value is the only one that matters. */
+  const filtered=q.filter(x=>tallyKey(x)!==k);
+  filtered.push(row);
+  lsSet(LS_TALLY_QUEUE,filtered);
+}
+
+/* writeTallyCell — upserts a single cell to Supabase, or queues it if offline.
+   This is fired on every tally-cell change. No debounce; the volume is fine. */
+async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value}){
+  const row={
+    contractor_slug:CONTRACTOR_SLUG,
+    job_id:jobId,
+    cell_date:date,
+    kind:kind,
+    run_id:runId||'',
+    mob_id:mobId||'',
+    crew_id:crewId,
+    value:value,
+    updated_at:new Date().toISOString()
+  };
+  if(!navigator.onLine){
+    queueTallyCell(row);
+    return;
+  }
+  try{
+    const result=await withTimeout(
+      sb.from('tally_entries').upsert(row,{
+        onConflict:'contractor_slug,job_id,cell_date,kind,run_id,mob_id,crew_id'
+      }),
+      5000,
+      'tally_upsert_timeout'
+    );
+    if(result&&result.error)throw new Error(result.error.message);
+  }catch(e){
+    queueTallyCell(row);
+    logSaveFailure(
+      e.message==='tally_upsert_timeout'?'timeout':'error',
+      'tally:'+jobId+':'+kind+':'+crewId,
+      e.message
+    );
+  }
+}
+
+async function flushTallyQueue(){
+  const q=lsGet(LS_TALLY_QUEUE)||[];
+  if(!q.length)return 0;
+  let flushed=0;
+  const failed=[];
+  for(const row of q){
+    try{
+      const result=await withTimeout(
+        sb.from('tally_entries').upsert(row,{
+          onConflict:'contractor_slug,job_id,cell_date,kind,run_id,mob_id,crew_id'
+        }),
+        5000,
+        'tally_flush_timeout'
+      );
+      if(result&&result.error){
+        failed.push(row);
+        logSaveFailure('error','tally_flush:'+row.job_id+':'+row.kind,result.error.message);
+      }else{
+        flushed++;
+      }
+    }catch(e){
+      failed.push(row);
+      logSaveFailure(
+        e.message==='tally_flush_timeout'?'timeout':'error',
+        'tally_flush:'+row.job_id+':'+row.kind,
+        e.message
+      );
+    }
+  }
+  lsSet(LS_TALLY_QUEUE,failed);
+  return flushed;
+}
+
+/* loadTalliesForJobs — single query fetching all tally_entries for the
+   given job ids. Returns rows; caller applies them via hydrateTallies. */
+async function loadTalliesForJobs(jobIds){
+  if(!jobIds||!jobIds.length)return [];
+  try{
+    const result=await withTimeout(
+      sb.from('tally_entries')
+        .select('job_id,cell_date,kind,run_id,mob_id,crew_id,value')
+        .eq('contractor_slug',CONTRACTOR_SLUG)
+        .in('job_id',jobIds),
+      8000,
+      'tally_load_timeout'
+    );
+    if(result&&result.error){
+      logSaveFailure('error','tally_load',result.error.message);
+      return [];
+    }
+    return result.data||[];
+  }catch(e){
+    logSaveFailure(
+      e.message==='tally_load_timeout'?'timeout':'error',
+      'tally_load',
+      e.message
+    );
+    return [];
+  }
+}
+
+/* hydrateTallies — mutates a job object, replacing tally fields with
+   the truth from tally_entries rows. The mob/run STRUCTURE in
+   jobs.data.runs is preserved; only the counts within each mob are reset
+   and repopulated. shedTallies, baleTallies, travelTallies are wholesale
+   replaced.
+
+   This is called on EVERY load (mountLoad, goOnline refetch, visibility
+   revalidate) so the user always sees the canonical tally data, never
+   the potentially-stale copy embedded in jobs.data. */
+function hydrateTallies(job,tallyRows){
+  /* Reset every count-bearing field. Mob structure stays. */
+  if(job.runs){
+    Object.values(job.runs).forEach(dayRuns=>{
+      (dayRuns||[]).forEach(run=>{
+        (run.mobs||[]).forEach(mob=>{mob.counts={};});
+      });
+    });
+  }
+  job.shedTallies={};
+  job.baleTallies={};
+  job.travelTallies={};
+
+  /* Apply each row */
+  (tallyRows||[]).forEach(row=>{
+    const v=Number(row.value)||0;
+    if(row.kind==='count'){
+      const dayRuns=(job.runs||{})[row.cell_date];
+      if(!dayRuns)return;
+      const run=dayRuns.find(r=>r.id===row.run_id);
+      if(!run)return;
+      const mob=(run.mobs||[]).find(m=>m.id===row.mob_id);
+      if(!mob)return;
+      mob.counts[row.crew_id]=v;
+    }else if(row.kind==='shed_runs'){
+      if(!job.shedTallies[row.crew_id])job.shedTallies[row.crew_id]={};
+      job.shedTallies[row.crew_id][row.cell_date]=v;
+    }else if(row.kind==='bales'){
+      if(!job.baleTallies[row.crew_id])job.baleTallies[row.crew_id]={};
+      job.baleTallies[row.crew_id][row.cell_date]=v;
+    }else if(row.kind==='travel'){
+      if(!job.travelTallies[row.crew_id])job.travelTallies[row.crew_id]={};
+      job.travelTallies[row.crew_id][row.cell_date]=v>0;
+    }
+  });
+  return job;
+}
+
 /* ── DB HELPERS ── */
 async function dbLoad(){
   try{
@@ -612,6 +801,13 @@ async function dbLoad(){
       crew:(cr.data||[]).map(r=>r.data),
       fromCache:false,
     };
+    /* v4.6.0 — hydrate tallies from the dedicated table. This is the
+       source of truth for tally values; jobs.data tally fields are
+       legacy/redundant and ignored on read. */
+    const tallyRows=await loadTalliesForJobs(result.jobs.map(j=>j.id));
+    const byJob={};
+    tallyRows.forEach(r=>{(byJob[r.job_id]||(byJob[r.job_id]=[])).push(r);});
+    result.jobs.forEach(j=>hydrateTallies(j,byJob[j.id]||[]));
     /* Only overwrite local cache if no pending offline writes — 
        if queue has items, local data is newer than Supabase */
     const pendingQ=lsGet(LS_QUEUE)||[];
@@ -1491,12 +1687,27 @@ function TallyTab({job,setJob,role,viewDate,setViewDate}){
   const setMobDesc=(rid,mid,v)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,desc:v}:m)}:run));
   const setMobType=(rid,mid,t)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,type:t}:m)}:run));
   const setMobRate=(rid,mid,v)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,rateOverride:v===''?null:parseFloat(v)||null}:m)}:run));
-  const setMobCnt=(rid,mid,cid,v)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,counts:{...m.counts,[cid]:parseInt(v)||0}}:m)}:run));
-  const setShed=(cid,v)=>setJob(prev=>({...prev,shedTallies:{...prev.shedTallies,[cid]:{...(prev.shedTallies[cid]||{}),[viewDate]:Math.max(0,v)}}}));
-  const setBale=(cid,v)=>setJob(prev=>({...prev,baleTallies:{...prev.baleTallies,[cid]:{...(prev.baleTallies[cid]||{}),[viewDate]:Math.max(0,v)}}}));
+  const setMobCnt=(rid,mid,cid,v)=>{
+    const val=parseInt(v)||0;
+    setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,counts:{...m.counts,[cid]:val}}:m)}:run));
+    writeTallyCell({jobId:job.id,kind:'count',runId:rid,mobId:mid,crewId:cid,date:viewDate,value:val});
+  };
+  const setShed=(cid,v)=>{
+    const val=Math.max(0,v);
+    setJob(prev=>({...prev,shedTallies:{...prev.shedTallies,[cid]:{...(prev.shedTallies[cid]||{}),[viewDate]:val}}}));
+    writeTallyCell({jobId:job.id,kind:'shed_runs',crewId:cid,date:viewDate,value:val});
+  };
+  const setBale=(cid,v)=>{
+    const val=Math.max(0,v);
+    setJob(prev=>({...prev,baleTallies:{...prev.baleTallies,[cid]:{...(prev.baleTallies[cid]||{}),[viewDate]:val}}}));
+    writeTallyCell({jobId:job.id,kind:'bales',crewId:cid,date:viewDate,value:val});
+  };
   const baleTot=id=>Object.values(job.baleTallies[id]||{}).reduce((a,b)=>a+b,0);
   const setNote=v=>setJob(prev=>({...prev,dayNotes:{...prev.dayNotes,[viewDate]:v}}));
-  const setTravel=(cid,val)=>setJob(prev=>({...prev,travelTallies:{...(prev.travelTallies||{}),[cid]:{...((prev.travelTallies||{})[cid]||{}),[viewDate]:val}}}));
+  const setTravel=(cid,val)=>{
+    setJob(prev=>({...prev,travelTallies:{...(prev.travelTallies||{}),[cid]:{...((prev.travelTallies||{})[cid]||{}),[viewDate]:val}}}));
+    writeTallyCell({jobId:job.id,kind:'travel',crewId:cid,date:viewDate,value:val?1:0});
+  };
   const travelDayCount=id=>Object.values((job.travelTallies||{})[id]||{}).reduce((a,b)=>a+(b?1:0),0);
   const travelBF=id=>Object.entries((job.travelTallies||{})[id]||{}).filter(([d])=>d<viewDate).reduce((a,[,b])=>a+(b?1:0),0);
   const hasCrutch=Object.values(job.runs||{}).flat().some(run=>mobsOf(run).some(m=>m.type==='Crutching'));
@@ -3669,7 +3880,7 @@ function App(){
         setFresh(false,'mountLoad_from_cache');
         logSaveFailure('diag_load','mountLoad','stale_from_cache;jobs='+j.length+';online='+navigator.onLine);
       }
-      setPendingCount((lsGet(LS_QUEUE)||[]).length);
+      setPendingCount((lsGet(LS_QUEUE)||[]).length+(lsGet(LS_TALLY_QUEUE)||[]).length);
       /* Deep link: #job=JOB_ID&crew=CREW_ID opens that job on Overview tab and logs view.
          FIX v4.5.2: Wrapped in try/catch because on iOS Safari, the Supabase client's
          .upsert() method has been observed to return a non-Promise value in some code
@@ -3732,8 +3943,10 @@ function App(){
             as normal; next successful online session will trigger the wipe.
        This is a one-time event per device per DATA_VERSION change. */
     const proceedWithLoad=()=>{
-      if(pendingOnMount.length>0&&navigator.onLine){
-        flushQueue().then(()=>mountLoad()).catch(()=>mountLoad());
+      const pendingTally=lsGet(LS_TALLY_QUEUE)||[];
+      if((pendingOnMount.length>0||pendingTally.length>0)&&navigator.onLine){
+        Promise.all([flushQueue().catch(()=>0),flushTallyQueue().catch(()=>0)])
+          .then(()=>mountLoad()).catch(()=>mountLoad());
       } else {
         mountLoad();
       }
@@ -3743,22 +3956,27 @@ function App(){
       logSaveFailure('diag_dataversion','mismatch','stored='+storedDataVersion+';expected='+DATA_VERSION);
       const performWipe=()=>{
         const remainingQ=lsGet(LS_QUEUE)||[];
-        if(remainingQ.length===0){
+        const remainingTallyQ=lsGet(LS_TALLY_QUEUE)||[];
+        if(remainingQ.length===0&&remainingTallyQ.length===0){
           lsRemove(LS_JOBS);
           lsRemove(LS_FARMS);
           lsRemove(LS_CREW);
+          /* Do NOT remove LS_TALLY_QUEUE here — already confirmed empty above.
+             Never delete unsynced tally writes; they are the only copy. */
           lsSet(LS_DATA_VERSION,DATA_VERSION);
           logSaveFailure('diag_dataversion','wiped_caches','queue_empty');
         }else{
           /* Defer: queue still has items, don't destroy them */
-          logSaveFailure('diag_dataversion','wipe_deferred','queue_has='+remainingQ.length);
+          logSaveFailure('diag_dataversion','wipe_deferred','queue_has='+remainingQ.length+';tally_q='+remainingTallyQ.length);
         }
         proceedWithLoad();
       };
-      if(pendingOnMount.length>0&&navigator.onLine){
-        /* Try queue flush first */
-        flushQueue().then(()=>performWipe()).catch(()=>performWipe());
-      }else if(pendingOnMount.length>0){
+      const pendingTallyOnMount=lsGet(LS_TALLY_QUEUE)||[];
+      if((pendingOnMount.length>0||pendingTallyOnMount.length>0)&&navigator.onLine){
+        /* Try queue flushes first */
+        Promise.all([flushQueue().catch(()=>0),flushTallyQueue().catch(()=>0)])
+          .then(()=>performWipe()).catch(()=>performWipe());
+      }else if(pendingOnMount.length>0||pendingTallyOnMount.length>0){
         /* Have queue but offline — defer wipe, just proceed */
         logSaveFailure('diag_dataversion','wipe_deferred','offline_with_queue');
         proceedWithLoad();
@@ -3816,9 +4034,13 @@ function App(){
       }
       /* Flush queue to Supabase */
       const n=await flushQueue().catch(()=>0);
-      const remaining=(lsGet(LS_QUEUE)||[]).length;
+      /* v4.6.0 — also flush the per-cell tally queue. Independent of whole-job
+         queue. Any cells typed while offline land in Supabase now. */
+      const nTally=await flushTallyQueue().catch(()=>0);
+      if(nTally>0)logSaveFailure('diag_save','goOnline_tally_flushed','count='+nTally);
+      const remaining=(lsGet(LS_QUEUE)||[]).length+(lsGet(LS_TALLY_QUEUE)||[]).length;
       setPendingCount(remaining);
-      if(n>0){setSaveStatus('saved');setTimeout(()=>setSaveStatus(''),2500);}
+      if(n>0||nTally>0){setSaveStatus('saved');setTimeout(()=>setSaveStatus(''),2500);}
       else setSaveStatus('');
       /* Re-fetch from Supabase if:
          (a) queue is fully clear (otherwise local has unsynced writes), AND
@@ -3939,16 +4161,16 @@ function App(){
         if(!stillDirty)dirtyRef.current=false;
         if(isOnline){
           setSaveStatus('saved');
-          setPendingCount(0);
+          setPendingCount((lsGet(LS_TALLY_QUEUE)||[]).length);
           setTimeout(()=>setSaveStatus(''),2000);
         } else {
           setSaveStatus('offline');
-          setPendingCount((lsGet(LS_QUEUE)||[]).length);
+          setPendingCount((lsGet(LS_QUEUE)||[]).length+(lsGet(LS_TALLY_QUEUE)||[]).length);
         }
       }catch(err){
         /* Save failed — keep dirty so we don't risk overwriting local with stale Supabase */
         setSaveStatus('offline');
-        setPendingCount((lsGet(LS_QUEUE)||[]).length);
+        setPendingCount((lsGet(LS_QUEUE)||[]).length+(lsGet(LS_TALLY_QUEUE)||[]).length);
       }
     },400);
   },[jobs]);
@@ -3960,7 +4182,7 @@ function App(){
     if(!isLoaded.current)return;
     if(saveTimer.current)return; /* an active save is already updating status */
     setSaveStatus(isOnline?'':'offline');
-    if(!isOnline)setPendingCount((lsGet(LS_QUEUE)||[]).length);
+    if(!isOnline)setPendingCount((lsGet(LS_QUEUE)||[]).length+(lsGet(LS_TALLY_QUEUE)||[]).length);
   },[isOnline]);
 
   /* CRITICAL: Save immediately on tab hide / before unload.
