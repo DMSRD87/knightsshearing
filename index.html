@@ -524,7 +524,7 @@ const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.0-storage-rebuild'; /* STORAGE REBUILD over v4.5.5.
+const APP_VERSION='v4.6.1-storage-rebuild'; /* STORAGE REBUILD over v4.5.5.
   Root cause of the recurring data-loss bug: dbSaveJob writes the entire job
   object (including runs, shedTallies, baleTallies, travelTallies) as a single
   blob. When two devices have out-of-sync React state, the device that wrote
@@ -535,12 +535,17 @@ const APP_VERSION='v4.6.0-storage-rebuild'; /* STORAGE REBUILD over v4.5.5.
   Fix: tally cells live in their own table now. tally_entries. One row per
   cell. Per-cell upsert on user input. On load, jobs.data is still read (for
   crew, rates, mob structure, etc.) but tally values are hydrated from
-  tally_entries and ALWAYS win over whatever's in jobs.data. The whole-job
-  blob can be stale or empty — tallies are safe.
+  tally_entries and ALWAYS win over whatever's in jobs.data.
 
-  v4.5.x freshness/dirty/suppressNext machinery is preserved because it
-  still protects non-tally job fields, but it's no longer load-bearing for
-  the data-loss bug. The data-loss bug is gone. */
+  v4.6.1 adds two follow-ups identified in code review:
+  (1) dbSaveJob now STRIPS tally fields from the Supabase blob before
+      writing — close the last vector where a stale device could write
+      zeros to jobs.data.runs even though tally_entries was authoritative.
+      The strip uses a deep-clone (NOT mutation) so React state stays
+      intact. LS_JOBS still keeps full tallies for offline fallback.
+  (2) goOnline now refetches tally_entries even when the full dbLoad
+      refetch is skipped (queue not empty / fresh+dirty), so a device
+      coming back online always picks up cells typed elsewhere. */
 const DATA_VERSION='2026-05-18-storage-rebuild'; /* Bump forces one-time localStorage wipe so all devices start clean on the new storage model. */
 
 const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{return null;}};
@@ -874,14 +879,49 @@ function logSaveFailure(reason,jobId,details){
   }catch(e){ /* never break the save flow */ }
 }
 
+/* buildStrippedJobBlob — produces a tally-free copy of a job suitable for
+   writing to the `jobs` table. Tally cells live in `tally_entries` now;
+   writing them again in the blob just re-creates the multi-device wipe
+   vector (a stale device could overwrite the blob with empty tallies
+   and "win" — until hydration reads on next load corrected it; better to
+   not write the stale data at all).
+
+   IMPORTANT: deep clones the runs structure rather than mutating the input.
+   The caller's `job` reference comes straight from React state via
+   jobsRef.current; mutating it would corrupt React's own state and is
+   exactly the kind of silent corruption bug that's been biting us. */
+function buildStrippedJobBlob(job){
+  const out={...job};
+  if(job.runs){
+    out.runs=Object.fromEntries(
+      Object.entries(job.runs).map(([date,dayRuns])=>[
+        date,
+        (dayRuns||[]).map(run=>({
+          ...run,
+          mobs:(run.mobs||[]).map(mob=>({...mob,counts:{}}))
+        }))
+      ])
+    );
+  }
+  out.shedTallies={};
+  out.baleTallies={};
+  out.travelTallies={};
+  return out;
+}
+
 async function dbSaveJob(job){
-  /* Always write to local cache first — this survives page close */
+  /* LS_JOBS — keep FULL job (tallies included). This is the offline
+     fallback when tally_entries can't be queried. Stripping here would
+     leave offline users with empty cells. */
   const jobs=lsGet(LS_JOBS)||[];
   const updated=jobs.find(j=>j.id===job.id)?jobs.map(j=>j.id===job.id?job:j):[job,...jobs];
   lsSet(LS_JOBS,updated);
+  /* Supabase write — STRIPPED. tally_entries is the source of truth for
+     tally cells; jobs.data only carries structure. */
+  const jobForBlob=buildStrippedJobBlob(job);
   /* Skip Supabase entirely if offline — avoids SW stub returning fake 200 */
   if(!navigator.onLine){
-    queueWrite('job',job.id,job);
+    queueWrite('job',job.id,jobForBlob);
     return;
   }
   /* Online path: cap the upsert at 5 seconds to prevent silent hangs.
@@ -890,15 +930,11 @@ async function dbSaveJob(job){
      the await never returns, the catch block never fires, and the data
      never makes it to the queue. */
   try{
-    /* PATCH v4.5.0 — Pre-save guard.
-       Fetch current Supabase state for this job. If Supabase has STRICTLY MORE
-       dates of runs than we're about to save, refuse the save — this state we'd
-       be about to write is regressive and almost certainly stale. Log the rejection
-       so we can investigate.
-       This is the last-line-of-defense against the multi-contractor wipe bug.
-       Even if isFresh gates fail somehow, this catches saves that would shrink
-       the job's runs history. */
-    const incomingRunDates=Object.keys((job&&job.runs)||{}).length;
+    /* PATCH v4.5.0 — Pre-save guard (preserved). Now operates on stripped
+       blob, but the run-DATE keys are unchanged by stripping (only the
+       counts within mobs are emptied), so the guard still functions as
+       designed: rejects writes that would shrink the run-date history. */
+    const incomingRunDates=Object.keys((jobForBlob&&jobForBlob.runs)||{}).length;
     if(incomingRunDates>0){
       const guardCheck=await withTimeout(
         sb.from('jobs').select('data').eq('id',job.id).eq('contractor_slug',CONTRACTOR_SLUG).maybeSingle(),
@@ -913,35 +949,27 @@ async function dbSaveJob(job){
             job.id,
             'incoming_dates='+incomingRunDates+';supabase_dates='+supabaseRunDates+';refused'
           );
-          /* Don't throw — just queue for later. Next save with full state will succeed. */
-          queueWrite('job',job.id,job);
+          queueWrite('job',job.id,jobForBlob);
           return;
         }
       }
     }
     const upsertCall=sb.from('jobs').upsert(
-      {id:job.id,contractor_slug:CONTRACTOR_SLUG,data:job,updated_at:new Date().toISOString()},
+      {id:job.id,contractor_slug:CONTRACTOR_SLUG,data:jobForBlob,updated_at:new Date().toISOString()},
       {onConflict:'id'}
     );
     const result=await withTimeout(upsertCall,5000,'upsert_timeout');
     if(result&&result.error)throw new Error(result.error.message);
     dequeue('job',job.id);
-    /* PATCH A — Snapshot system. After every successful main save, fire a
-       parallel upsert into job_snapshots keyed by (slug, job_id, today AEST).
-       Throughout today this overwrites today's row. At local midnight, today
-       rolls over to a new date and yesterday's snapshot becomes frozen — no
-       future write can target it. Recovery from any future wipe = a single
-       UPDATE query against the most recent snapshot.
-
-       Fire-and-forget with 3s timeout. The main save has already succeeded;
-       a failed snapshot must not block, throw, or affect anything user-facing.
-       Failures are logged to save_failures for visibility. */
+    /* PATCH A — Snapshot system. Snapshots use the FULL job (including
+       tallies from React state) as a recovery option. Yesterday and
+       earlier snapshots remain frozen and intact. */
     try{
       const snapPayload={
         contractor_slug:CONTRACTOR_SLUG,
         job_id:job.id,
         snapshot_date:localToday(),
-        data:job,
+        data:job, /* full job — tallies included for recovery */
         updated_at:new Date().toISOString()
       };
       withTimeout(
@@ -956,7 +984,7 @@ async function dbSaveJob(job){
     }catch(snapErr){ /* never break the save flow */ }
   }catch(e){
     /* Queue for retry on next online event or mountLoad */
-    queueWrite('job',job.id,job);
+    queueWrite('job',job.id,jobForBlob);
     /* Log forensically — fire-and-forget, never throws */
     logSaveFailure(
       e.message==='upsert_timeout'?'timeout':'error',
@@ -4071,6 +4099,25 @@ function App(){
             logSaveFailure('diag_load','goOnline_dbLoad','promoted_to_fresh');
           }
         });
+      }else{
+        /* v4.6.1 — even when full dbLoad refetch is skipped (queue still has
+           items OR React state is fresh+dirty), tally cells are always safe
+           to refresh from tally_entries. They live in their own table and
+           the user's own per-cell writes have already gone through (queue
+           was flushed above). Pulls in any cells written by OTHER devices
+           since this device went online — critical for the
+           one-lead-handover-at-smoko scenario where Sandra hands off to
+           someone else mid-shed. */
+        const jobIds=jobsRef.current.map(j=>j.id);
+        if(jobIds.length>0){
+          loadTalliesForJobs(jobIds).then(freshTallies=>{
+            const byJob={};
+            (freshTallies||[]).forEach(r=>{(byJob[r.job_id]||(byJob[r.job_id]=[])).push(r);});
+            suppressNextSaveRef.current=true;
+            setJobs(prev=>prev.map(j=>hydrateTallies({...j},byJob[j.id]||[])));
+            logSaveFailure('diag_load','goOnline_tally_refresh','jobs='+jobIds.length+';rows='+(freshTallies||[]).length);
+          }).catch(()=>{});
+        }
       }
     };
     const goOffline=()=>{setIsOnline(false);setSaveStatus('');};
