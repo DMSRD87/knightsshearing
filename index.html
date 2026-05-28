@@ -526,7 +526,7 @@ const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.3a-mob-totals'; /* v4.6.3a adds MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
+const APP_VERSION='v4.6.3b-cascade-delete'; /* v4.6.3b adds cascade delete from tally_entries on delRun/delMob — fixes zombie runs resurrecting via self-heal (Knights, 28 May). v4.6.3a added MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
   vectors that survived v4.6.2. The Woolaway incident on 21 May 2026 showed
   three structural gaps even after v4.6.2:
 
@@ -1915,7 +1915,25 @@ function TallyTab({job,setJob,role,viewDate,setViewDate}){
   const dtLbl=DAY_NAMES[vdt.getDay()].toUpperCase()+' '+String(vdt.getDate()).padStart(2,'0')+'/'+String(vdt.getMonth()+1).padStart(2,'0');
   const setRuns=fn=>setJob(prev=>({...prev,runs:{...prev.runs,[viewDate]:fn((prev.runs||{})[viewDate]||[])}}));
   const addRun=()=>setRuns(r=>[...r,{id:'r'+Date.now(),mobs:[{id:'m'+Date.now(),type:'Shearing',desc:'',counts:{}}]}]);
-  const delRun=rid=>{setRuns(r=>r.filter(x=>x.id!==rid));setConfirmDelRun(null);};
+  const delRun=async rid=>{
+    setConfirmDelRun(null);
+    /* v4.6.3b: cascade-delete tally_entries before removing from state. Without this,
+       orphan cells make the shrink-save guard reject the truncated blob, and
+       self-heal synthesizes the run back from the cells (defaulting to type Shearing). */
+    if(typeof sb!=='undefined'&&sb&&navigator.onLine){
+      try{
+        const res=await withTimeout(
+          sb.from('tally_entries').delete()
+            .eq('contractor_slug',CONTRACTOR_SLUG)
+            .eq('job_id',job.id)
+            .eq('run_id',rid),
+          5000,'cascade_timeout');
+        if(res&&res.error)logSaveFailure('error','delRun_cascade','run='+rid+';err='+res.error.message);
+        else try{logSaveFailure('diag_cascade',job.id,'delRun_ok:run='+rid);}catch(e){}
+      }catch(e){logSaveFailure('error','delRun_cascade_throw','run='+rid+';err='+(e&&e.message||'unknown'));}
+    }
+    setRuns(r=>r.filter(x=>x.id!==rid));
+  };
   const moveShearer=(idx,dir)=>{
     const target=idx+dir;
     if(target<0||target>=orderedShearers.length)return;
@@ -1924,7 +1942,24 @@ function TallyTab({job,setJob,role,viewDate,setViewDate}){
     setJob(prev=>({...prev,shearerOrder:next}));
   };
   const addMob=(rid,type)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:[...mobsOf(run),{id:'m'+Date.now(),type,desc:'',counts:{}}]}:run));
-  const delMob=(rid,mid)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).filter(m=>m.id!==mid)}:run));
+  const delMob=async(rid,mid)=>{
+    /* v4.6.3b: cascade-delete tally_entries for this mob before state update.
+       Same reasoning as delRun — orphan cells will resurrect the mob as a duplicate. */
+    if(typeof sb!=='undefined'&&sb&&navigator.onLine){
+      try{
+        const res=await withTimeout(
+          sb.from('tally_entries').delete()
+            .eq('contractor_slug',CONTRACTOR_SLUG)
+            .eq('job_id',job.id)
+            .eq('run_id',rid)
+            .eq('mob_id',mid),
+          5000,'cascade_timeout');
+        if(res&&res.error)logSaveFailure('error','delMob_cascade','mob='+mid+';err='+res.error.message);
+        else try{logSaveFailure('diag_cascade',job.id,'delMob_ok:mob='+mid);}catch(e){}
+      }catch(e){logSaveFailure('error','delMob_cascade_throw','mob='+mid+';err='+(e&&e.message||'unknown'));}
+    }
+    setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).filter(m=>m.id!==mid)}:run));
+  };
   const setMobDesc=(rid,mid,v)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,desc:v}:m)}:run));
   const setMobType=(rid,mid,t)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,type:t}:m)}:run));
   const setMobRate=(rid,mid,v)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,rateOverride:v===''?null:parseFloat(v)||null}:m)}:run));
