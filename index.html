@@ -526,7 +526,7 @@ const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.3-storage-rebuild'; /* v4.6.3 closes the data-loss
+const APP_VERSION='v4.6.3a-mob-totals'; /* v4.6.3a adds MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
   vectors that survived v4.6.2. The Woolaway incident on 21 May 2026 showed
   three structural gaps even after v4.6.2:
 
@@ -1577,6 +1577,49 @@ function generateSummary(job,period){
   });
   const totalShorn=shIds.reduce((s,id)=>s+(shornBy[id].sh+shornBy[id].cr),0);
   const jobTotal=totalShEarn+totalTeamLoad+totalShedEarn+totalTravel;
+  /* MOB TOTALS - grower-invoice view, base rates only. Loadings shown as a separate line. */
+  const mobTotals={};
+  Object.entries(job.runs||{}).forEach(([date,dayRuns])=>{
+    if(!inP(date))return;
+    dayRuns.forEach(run=>{mobsOf(run).forEach(mob=>{
+      const baseRate=mob.rateOverride!=null?mob.rateOverride:(mob.type==='Shearing'?rates.shearingPerHead:rates.crutchingPerHead)||0;
+      const desc=mob.desc||'Unspecified';
+      const key=mob.type+'|'+desc+'|'+baseRate.toFixed(4);
+      if(!mobTotals[key])mobTotals[key]={type:mob.type,desc,rate:baseRate,count:0,earn:0};
+      shIds.forEach(id=>{
+        const cnt=mob.counts[id]||0;if(!cnt)return;
+        mobTotals[key].count+=cnt;mobTotals[key].earn+=cnt*baseRate;
+      });
+    });});
+  });
+  const mobsList=Object.values(mobTotals).filter(m=>m.count>0);
+  if(mobsList.length>0){
+    const shMobs=mobsList.filter(m=>m.type==='Shearing');
+    const crMobs=mobsList.filter(m=>m.type==='Crutching');
+    const shSub=shMobs.reduce((s,m)=>s+m.earn,0);
+    const crSub=crMobs.reduce((s,m)=>s+m.earn,0);
+    const mobsSubtotal=shSub+crSub;
+    const individualLoadings=Math.max(0,totalShEarn-mobsSubtotal);
+    const totalAllLoadings=individualLoadings+totalTeamLoad;
+    L.push('');L.push(dash);L.push('');L.push('MOB TOTALS');L.push(dash);L.push('');
+    const writeMobLine=m=>{
+      L.push('  '+pad((m.desc||'Unspecified')+':',22)+pad(m.count.toLocaleString()+' head',11)+' @ $'+m.rate.toFixed(2)+'  = $'+m.earn.toFixed(2));
+    };
+    if(shMobs.length>0){
+      L.push('Sheep shorn:');
+      shMobs.forEach(writeMobLine);
+      if(shMobs.length>1)L.push('  '+pad('Subtotal shorn:',36)+'$'+shSub.toFixed(2));
+      L.push('');
+    }
+    if(crMobs.length>0){
+      L.push('Sheep crutched:');
+      crMobs.forEach(writeMobLine);
+      if(crMobs.length>1)L.push('  '+pad('Subtotal crutched:',36)+'$'+crSub.toFixed(2));
+      L.push('');
+    }
+    if(totalAllLoadings>0.005)L.push(pad('Shearer loadings:',38)+'$'+totalAllLoadings.toFixed(2));
+    L.push(pad('TOTAL SHEARER WAGES:',38)+'$'+(mobsSubtotal+totalAllLoadings).toFixed(2));
+  }
   L.push('');L.push(dash);L.push('');L.push('CONTRACTOR TOTALS');L.push(dash);L.push('');
   L.push('Total sheep: '+totalShorn.toLocaleString());
   L.push('Shearer wages:    $'+totalShEarn.toFixed(2));
