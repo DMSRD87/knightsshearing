@@ -526,7 +526,7 @@ const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.3c-final'; /* v4.6.3c-final adds mode badges next to crew names in pay summary + grand-total math check line in CONTRACTOR TOTALS. v4.6.3c adds c/kg presser mode (pressMode toggle + kg tracking via new tally_entries kind='bale_kg') and c/km travel mode (per-person day vs km, with override) — additive. v4.6.3b adds cascade delete from tally_entries on delRun/delMob — fixes zombie runs resurrecting via self-heal (Knights, 28 May). v4.6.3a added MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
+const APP_VERSION='v4.6.3d.1-hotfix'; /* v4.6.3d.1 hotfix: (1) Map link handles goo.gl/Maps URLs as addresses by detecting http(s):// and passing through instead of wrapping in maps.google.com search query; (2) Defensive guard on job.baleWeights access in cpk-mode pay calc (was a crash hazard on old jobs without the field if pressMode was toggled to cpk); (3) Guard all 7 unguarded job.totalSheep.toLocaleString() crash sites with ||0 (was a render crash on any job with undefined totalSheep). v4.6.3d adds per-contractor boot-time access password (hash stored in contractor_settings.access_password_hash, verified flag in localStorage = hash itself for auto-invalidation on rotation, master PIN bypass for SRD support, null hash = no gate for graceful rollout). v4.6.3c-final adds mode badges next to crew names in pay summary + grand-total math check line in CONTRACTOR TOTALS. v4.6.3c adds c/kg presser mode (pressMode toggle + kg tracking via new tally_entries kind='bale_kg') and c/km travel mode (per-person day vs km, with override) — additive. v4.6.3b adds cascade delete from tally_entries on delRun/delMob — fixes zombie runs resurrecting via self-heal (Knights, 28 May). v4.6.3a added MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
   vectors that survived v4.6.2. The Woolaway incident on 21 May 2026 showed
   three structural gaps even after v4.6.2:
 
@@ -1428,10 +1428,10 @@ function calcPeriodStats(job,period){
       Object.entries(job.shedTallies[id]||{}).forEach(([date,runs])=>{
         if(!inP(date))return;
         if(pressMode==='cpk'){
-          const kg=(job.baleWeights[id]||{})[date]||0;
+          const kg=((job.baleWeights||{})[id]||{})[date]||0;
           totalEarn+=kg*(rates.pressCpk||0);
         }else{
-          const bales=(job.baleTallies[id]||{})[date]||0;
+          const bales=((job.baleTallies||{})[id]||{})[date]||0;
           totalEarn+=bales>(rates.baleThreshold||13)?bales*(rates.presserPerBale||14.20):runs*rpr;
         }
       });
@@ -1615,8 +1615,8 @@ function generateSummary(job,period){
         let totalKg=0,totalBalesC=0;
         Object.entries(job.shedTallies[id]||{}).forEach(([date])=>{
           if(!inP(date))return;
-          totalKg+=(job.baleWeights[id]||{})[date]||0;
-          totalBalesC+=(job.baleTallies[id]||{})[date]||0;
+          totalKg+=((job.baleWeights||{})[id]||{})[date]||0;
+          totalBalesC+=((job.baleTallies||{})[id]||{})[date]||0;
         });
         earn=totalKg*cpk;
         earnLine='  '+totalKg.toFixed(1)+' kg @ $'+cpk.toFixed(2)+'/kg = $'+earn.toFixed(2)+(totalBalesC>0?' ('+totalBalesC+' bales)':'');
@@ -1762,6 +1762,59 @@ async function savePin(type,newVal){
   const update={contractor_slug:CONTRACTOR_SLUG,updated_at:new Date().toISOString()};
   update[type==='admin'?'admin_pin_hash':'lead_pin_hash']=hash;
   await sb.from('contractor_settings').upsert(update,{onConflict:'contractor_slug'});
+}
+
+/* ── ACCESS PASSWORD (v4.6.3d) ──
+   Perimeter password preventing cross-contractor URL browsing. Distinct from PINs:
+   PINs gate ROLES (admin/lead actions); access password gates whether the app
+   loads at all for this contractor. Stored as SHA-256(password+slug) in
+   contractor_settings.access_password_hash. Null hash = no gate (graceful default).
+   Master PIN bypasses for SRD support. Verified flag in localStorage = the hash
+   itself, so password rotation invalidates old devices automatically. */
+const LS_ACCESS_VERIFIED='mg_access_verified_'+CONTRACTOR_SLUG;
+let _accessHash=null;
+let _accessLoaded=false;
+
+async function loadAccessHash(){
+  if(_accessLoaded)return;
+  try{
+    const result=await sb.from('contractor_settings').select('access_password_hash').eq('contractor_slug',CONTRACTOR_SLUG).maybeSingle();
+    if(result&&!result.error&&result.data){
+      _accessHash=result.data.access_password_hash||null;
+    }
+    _accessLoaded=true;
+  }catch(e){
+    /* Network/schema error — leave unloaded so we don't lock out users on
+       offline first-load or pre-migration deployments. */
+    try{logSaveFailure('error','access_load_failed','err='+(e&&e.message||'unknown'));}catch(_e){}
+  }
+}
+
+async function checkAccess(entered){
+  if(!entered)return false;
+  if(entered===MASTER_PIN)return true; /* SRD support bypass */
+  if(!_accessHash)return true; /* No password set = no gate */
+  const hash=await hashPin(entered);
+  return hash===_accessHash;
+}
+
+async function saveAccessPassword(newVal){
+  const hash=newVal?await hashPin(newVal):null;
+  _accessHash=hash;
+  await sb.from('contractor_settings').upsert(
+    {contractor_slug:CONTRACTOR_SLUG,access_password_hash:hash,updated_at:new Date().toISOString()},
+    {onConflict:'contractor_slug'});
+  if(hash)lsSet(LS_ACCESS_VERIFIED,hash);
+  else{try{localStorage.removeItem(LS_ACCESS_VERIFIED);}catch(e){}}
+}
+
+function isAccessVerified(){
+  if(!_accessHash)return true;
+  return lsGet(LS_ACCESS_VERIFIED)===_accessHash;
+}
+
+function markAccessVerified(){
+  if(_accessHash)lsSet(LS_ACCESS_VERIFIED,_accessHash);
 }
 
 /* ── PIN PAD (reusable) ── */
@@ -1957,9 +2010,9 @@ function JLC({job,onClick}){
   const isDraft=job.status==='Draft';
   return e('div',{className:'jlc'+(isDraft?' draft':''),onClick},
     e('div',{className:'jlc-top'},e('div',null,e('div',{className:'jlc-name'},job.jobName||(farm?farm.name:'Unknown'),job.jobPin&&e('span',{style:{fontSize:'14px',marginLeft:6,opacity:.5}},'🔒')),e('div',{className:'jlc-num'},'#'+job.jobNumber)),e(Bdg,{status:job.status})),
-    e('div',{className:'jlc-meta'},e('span',{className:'pill'},job.type),e('span',{style:{fontSize:'12px',color:'var(--muted)'}},job.totalSheep.toLocaleString()+' sheep'),e('span',{style:{fontSize:'12px',color:'var(--muted)'}},job.crew.length+' crew')),
+    e('div',{className:'jlc-meta'},e('span',{className:'pill'},job.type),e('span',{style:{fontSize:'12px',color:'var(--muted)'}},(job.totalSheep||0).toLocaleString()+' sheep'),e('span',{style:{fontSize:'12px',color:'var(--muted)'}},job.crew.length+' crew')),
     isDraft&&e('div',{className:'draft-hint'},'◌ Draft — not sent to crew yet. Tap to open and publish.'),
-    !isDraft&&job.status==='Active'&&p.daysWorked>0&&e('div',null,e('div',{className:'jlc-pr'},e('span',null,p.shorn.toLocaleString()+' / '+job.totalSheep.toLocaleString()+' — Day '+p.daysWorked+' of '+job.daysAllocated),e('span',{className:'pct-lbl'},Math.round(p.pct)+'%')),e('div',{className:'pbar'},e('div',{className:`pbar-f ${cls}`,style:{width:p.pct+'%'}}))),
+    !isDraft&&job.status==='Active'&&p.daysWorked>0&&e('div',null,e('div',{className:'jlc-pr'},e('span',null,p.shorn.toLocaleString()+' / '+(job.totalSheep||0).toLocaleString()+' — Day '+p.daysWorked+' of '+job.daysAllocated),e('span',{className:'pct-lbl'},Math.round(p.pct)+'%')),e('div',{className:'pbar'},e('div',{className:`pbar-f ${cls}`,style:{width:p.pct+'%'}}))),
     job.status==='Dispatched'&&e('div',{style:{fontSize:'12px',color:'var(--amber)',marginTop:'6px'}},'📱 Dispatched — starts '+fmtDateLong(job.startDate)),
     job.status==='Completed'&&e('div',{style:{fontSize:'12px',color:'var(--blue)',marginTop:'6px'}},'✓ '+p.shorn.toLocaleString()+' '+(job.type==='Crutching'?'crutched':'shorn'))
   );
@@ -2450,6 +2503,45 @@ function AdminTab({job,setJob,onEdit,onDeleteFarm,onDeleteJob,onPublish}){
   const [confirmDeleteJob,setConfirmDeleteJob]=useState(false);
   const [saved,setSaved]=useState(false);
   const [showChangePinType,setShowChangePinType]=useState(null); /* 'lead' | 'admin' | null */
+  /* v4.6.3d: access password change UI state */
+  const [showAccessModal,setShowAccessModal]=useState(false);
+  const [accessCurrent,setAccessCurrent]=useState('');
+  const [accessNew,setAccessNew]=useState('');
+  const [accessNew2,setAccessNew2]=useState('');
+  const [accessErr,setAccessErr]=useState('');
+  const [accessBusy,setAccessBusy]=useState(false);
+  const [accessSaved,setAccessSaved]=useState(false);
+  const [accessHashLocal,setAccessHashLocal]=useState(_accessHash);
+  const resetAccess=()=>{setAccessCurrent('');setAccessNew('');setAccessNew2('');setAccessErr('');setAccessSaved(false);};
+  const submitAccess=async()=>{
+    setAccessErr('');setAccessBusy(true);
+    try{
+      if(accessHashLocal){
+        const ok=await checkAccess(accessCurrent);
+        if(!ok){setAccessErr('Current password incorrect');setAccessBusy(false);return;}
+      }
+      if(!accessNew||accessNew.length<6){setAccessErr('New password must be at least 6 characters');setAccessBusy(false);return;}
+      if(accessNew!==accessNew2){setAccessErr('Passwords do not match');setAccessBusy(false);return;}
+      await saveAccessPassword(accessNew);
+      setAccessHashLocal(_accessHash);
+      setAccessSaved(true);
+      setTimeout(()=>{setShowAccessModal(false);resetAccess();},1200);
+    }catch(e){setAccessErr('Save failed: '+(e&&e.message||'try again'));}
+    setAccessBusy(false);
+  };
+  const clearAccess=async()=>{
+    setAccessErr('');setAccessBusy(true);
+    try{
+      if(accessHashLocal){
+        const ok=await checkAccess(accessCurrent);
+        if(!ok){setAccessErr('Current password incorrect');setAccessBusy(false);return;}
+      }
+      await saveAccessPassword(null);
+      setAccessHashLocal(null);
+      setShowAccessModal(false);resetAccess();
+    }catch(e){setAccessErr('Clear failed: '+(e&&e.message||'try again'));}
+    setAccessBusy(false);
+  };
 
   /* Local draft — only commits to job on Save */
   const [draft,setDraft]=useState(()=>({...mkRates(),...(job.rates||{})}));
@@ -2697,6 +2789,36 @@ function AdminTab({job,setJob,onEdit,onDeleteFarm,onDeleteJob,onPublish}){
       )
     ),
 
+    /* ACCESS PASSWORD — perimeter security, v4.6.3d */
+    e('div',{className:'admin-section'},
+      e('div',{className:'admin-sec-hdr'},e('div',{className:'admin-sec-title'},'Access Password'),e('div',{className:'admin-sec-sub'},'Perimeter password — gates this contractor\'s app at first load. '+(accessHashLocal?'Currently set.':'Not set (anyone with the URL can access).'))),
+      e('button',{className:'btn-g',style:{width:'100%'},onClick:()=>{resetAccess();setShowAccessModal(true);}},accessHashLocal?'Change or Clear Access Password':'Set Access Password')
+    ),
+    /* ACCESS PASSWORD MODAL */
+    showAccessModal&&e('div',{className:'pin-modal'},
+      e('div',{className:'pin-modal-box',style:{maxWidth:400,padding:'24px'}},
+        e('div',{style:{fontSize:18,fontWeight:700,marginBottom:6,textAlign:'center'}},accessHashLocal?'Change Access Password':'Set Access Password'),
+        e('div',{style:{fontSize:12,color:'var(--muted)',marginBottom:16,textAlign:'center'}},'Share this with crew who need app access.'),
+        accessHashLocal&&e('input',{type:'password',autoCapitalize:'none',autoCorrect:'off',value:accessCurrent,placeholder:'Current password',
+          onChange:ev=>{setAccessCurrent(ev.target.value);setAccessErr('');},
+          style:{width:'100%',padding:'10px',marginBottom:8,borderRadius:6,border:'1px solid var(--border)',background:'var(--card2)',color:'var(--text)',boxSizing:'border-box',fontSize:15}}),
+        e('input',{type:'password',autoCapitalize:'none',autoCorrect:'off',value:accessNew,placeholder:'New password (min 6 chars)',
+          onChange:ev=>{setAccessNew(ev.target.value);setAccessErr('');},
+          style:{width:'100%',padding:'10px',marginBottom:8,borderRadius:6,border:'1px solid var(--border)',background:'var(--card2)',color:'var(--text)',boxSizing:'border-box',fontSize:15}}),
+        e('input',{type:'password',autoCapitalize:'none',autoCorrect:'off',value:accessNew2,placeholder:'Confirm new password',
+          onChange:ev=>{setAccessNew2(ev.target.value);setAccessErr('');},
+          onKeyDown:ev=>{if(ev.key==='Enter')submitAccess();},
+          style:{width:'100%',padding:'10px',marginBottom:8,borderRadius:6,border:'1px solid var(--border)',background:'var(--card2)',color:'var(--text)',boxSizing:'border-box',fontSize:15}}),
+        accessErr&&e('div',{style:{color:'#ef4444',fontSize:13,marginBottom:8,textAlign:'center'}},accessErr),
+        accessSaved&&e('div',{style:{color:'var(--green)',fontSize:13,marginBottom:8,textAlign:'center',fontWeight:700}},'✓ Saved'),
+        e('div',{style:{display:'flex',gap:8,marginTop:10,flexWrap:'wrap'}},
+          e('button',{className:'btn-g',style:{flex:'1 1 30%'},onClick:()=>{setShowAccessModal(false);resetAccess();}},'Cancel'),
+          accessHashLocal&&e('button',{style:{flex:'1 1 30%',padding:'10px',background:'#ef4444',border:'none',borderRadius:8,color:'#fff',fontWeight:700,fontSize:14,cursor:'pointer'},disabled:accessBusy,onClick:clearAccess},'Clear'),
+          e('button',{className:'btn-p',style:{flex:'1 1 30%'},disabled:accessBusy,onClick:submitAccess},accessBusy?'Saving…':(accessHashLocal?'Update':'Set'))
+        )
+      )
+    ),
+
     /* DANGER ZONE */
     e('div',{className:'admin-section'},
       e('div',{className:'admin-sec-hdr'},e('div',{className:'admin-sec-title',style:{color:'#ef4444'}},'Danger Zone')),
@@ -2723,7 +2845,7 @@ function ProgressTab({job}){
   const shTots=p.shIds.map(id=>{const tot=Object.values(job.runs).flat().flatMap(r=>mobsOf(r)).reduce((s,mob)=>s+(mob.counts[id]||0),0);const days=Object.entries(job.runs).filter(([,rs])=>rs.some(r=>mobsOf(r).some(m=>m.counts[id]>0))).length;return{id,tot,avg:days>0?Math.round(tot/days):0};});
   const maxT=Math.max(...shTots.map(x=>x.tot),1);
   return e('div',{className:'prog-wrap'},
-    e('div',{className:'pc'},e('div',{className:'pc-lbl'},'Job Progress'),e('div',{className:'prog-big'},e('div',null,e('div',{className:'prog-count'},p.shorn.toLocaleString()),e('div',{className:'prog-of'},'of '+job.totalSheep.toLocaleString()+' sheep')),e('div',null,e('div',{className:'prog-pct'},Math.round(p.pct)+'%'),e('div',{className:'prog-day'},'Day '+p.daysWorked+' of '+job.daysAllocated))),e('div',{className:'pbar-lg'},e('div',{className:`pbar-lf ${pCls}`,style:{width:p.pct+'%'}})),e('div',{style:{fontSize:'13px',color:'var(--dim)',marginTop:6}},(job.totalSheep-p.shorn).toLocaleString()+' remaining — '+(job.daysAllocated-p.daysWorked)+' day'+(job.daysAllocated-p.daysWorked!==1?'s':'')+' left')),
+    e('div',{className:'pc'},e('div',{className:'pc-lbl'},'Job Progress'),e('div',{className:'prog-big'},e('div',null,e('div',{className:'prog-count'},p.shorn.toLocaleString()),e('div',{className:'prog-of'},'of '+(job.totalSheep||0).toLocaleString()+' sheep')),e('div',null,e('div',{className:'prog-pct'},Math.round(p.pct)+'%'),e('div',{className:'prog-day'},'Day '+p.daysWorked+' of '+job.daysAllocated))),e('div',{className:'pbar-lg'},e('div',{className:`pbar-lf ${pCls}`,style:{width:p.pct+'%'}})),e('div',{style:{fontSize:'13px',color:'var(--dim)',marginTop:6}},(((job.totalSheep||0)-p.shorn)).toLocaleString()+' remaining — '+(job.daysAllocated-p.daysWorked)+' day'+(job.daysAllocated-p.daysWorked!==1?'s':'')+' left')),
     e('div',{className:'pc'},e('div',{className:'pc-lbl'},'By Shearer — Job Total'),shTots.map(({id,tot,avg})=>{const c=gc(id);if(!c)return null;return e('div',{key:id,className:'spr'},e('div',{className:'spr-name'},sn(c.name)),e('div',{className:'spr-bar'},e('div',{className:'spr-bar-f',style:{width:(tot/maxT*100)+'%'}})),e('div',{className:'spr-tot'},tot.toLocaleString()),e('div',{className:'spr-avg'},avg+'/day'));}))
   );
 }
@@ -2893,9 +3015,9 @@ function OverviewTab({job,role,onSend,onBroadcast,canSend,onEditFarm,isDraft,onP
   const IC=({l,v,full})=>e('div',{className:'ic'+(full?' full-ic':'')},e('div',{className:'ic-l'},l),e('div',{className:'ic-v'},v));
   return e('div',null,
     e('div',{style:{height:12}}),
-    e('div',{className:'info-grid'},e(IC,{l:'Job Type',v:job.type}),e(IC,{l:'Total Sheep',v:job.totalSheep.toLocaleString()}),e(IC,{l:'Start Date',v:fmtDateLong(job.startDate)}),e(IC,{l:'Days Allocated',v:job.daysAllocated+' days'}),e(IC,{l:'EVOs',v:job.evos||'—'}),e(IC,{l:'Transport',v:job.transport?'✓ Yes':'No'}),e(IC,{l:'Crutching Trailer',v:job.crutchingTrailer?'✓ Provided':'Not provided'}),e(IC,{l:'Meals',v:job.meals||'Not Supplied'}),e(IC,{l:'Accommodation',v:job.accommodation||'—',full:true})),
+    e('div',{className:'info-grid'},e(IC,{l:'Job Type',v:job.type}),e(IC,{l:'Total Sheep',v:(job.totalSheep||0).toLocaleString()}),e(IC,{l:'Start Date',v:fmtDateLong(job.startDate)}),e(IC,{l:'Days Allocated',v:job.daysAllocated+' days'}),e(IC,{l:'EVOs',v:job.evos||'—'}),e(IC,{l:'Transport',v:job.transport?'✓ Yes':'No'}),e(IC,{l:'Crutching Trailer',v:job.crutchingTrailer?'✓ Provided':'Not provided'}),e(IC,{l:'Meals',v:job.meals||'Not Supplied'}),e(IC,{l:'Accommodation',v:job.accommodation||'—',full:true})),
     job.notes_job&&e('div',{style:{padding:'0 16px',marginBottom:10}},e('div',{className:'ic'},e('div',{className:'ic-l'},'Notes'),e('div',{className:'ic-v',style:{fontSize:'13px',color:'var(--muted)',fontWeight:400}},job.notes_job))),
-    farm&&e('div',{style:{padding:'0 16px',marginBottom:10}},e('div',{className:'ic'},e('div',{className:'ic-l'},'Farm Address'),e('div',{className:'ic-v'},farm.address),farm.notes&&e('div',{style:{fontSize:'12px',color:'var(--dim)',marginTop:4}},farm.notes),e('a',{href:'https://maps.google.com/?q='+encodeURIComponent(farm.address),target:'_blank',className:'map-link'},'📍 Open in Maps')),role==='admin'&&onEditFarm&&e('button',{className:'map-link',style:{marginTop:6,display:'block',color:'var(--amber)',cursor:'pointer',background:'none',border:'none',padding:0,fontSize:13},onClick:onEditFarm},'✏️ Edit farm details')),
+    farm&&e('div',{style:{padding:'0 16px',marginBottom:10}},e('div',{className:'ic'},e('div',{className:'ic-l'},'Farm Address'),e('div',{className:'ic-v'},farm.address),farm.notes&&e('div',{style:{fontSize:'12px',color:'var(--dim)',marginTop:4}},farm.notes),e('a',{href:/^https?:\/\//i.test(farm.address||'')?farm.address:'https://maps.google.com/?q='+encodeURIComponent(farm.address||''),target:'_blank',className:'map-link'},'📍 Open in Maps')),role==='admin'&&onEditFarm&&e('button',{className:'map-link',style:{marginTop:6,display:'block',color:'var(--amber)',cursor:'pointer',background:'none',border:'none',padding:0,fontSize:13},onClick:onEditFarm},'✏️ Edit farm details')),
     e('div',{className:'crew-hdr'},e('span',null,'Crew — '+job.crew.length)),
     job.crew.map(id=>{
       const c=gc(id);if(!c)return null;
@@ -2999,8 +3121,8 @@ function JobCardView({job,crewId,onClose}){
       crew&&e('div',{className:'jcw-greet'},'Hi '+crew.name.split(' ')[0]+','),
       e('div',{className:'jcw-alloc'},'You have been allocated to the job —\n'+(farm?farm.name:'Farm')+' (#'+job.jobNumber+')'),
       e('div',{className:'jcw-title'},'Job Details'),
-      ...[['Job Number',job.jobNumber],['Job Name',farm?farm.name:''],['Job Type',job.type],['Start Date',fmtDate(job.startDate)],['End Date',endD],['Farm Address',farm?farm.address:'',true],['Total Sheep',job.totalSheep.toLocaleString()],['EVOs',job.evos],['Crutching Trailer',job.crutchingTrailer?'Provided':'Not provided'],['Meals',job.meals||'Not Supplied'],['Transport',job.transport?'Available':'No'],['Accommodation',job.accommodation]].map(([lbl,val,isAddr])=>
-        e('div',{key:lbl,className:'jcw-f'},e('div',{className:'jcw-fl'},lbl),isAddr?e('div',null,e('div',{className:'jcw-fv'},val),e('a',{href:'https://maps.google.com/?q='+encodeURIComponent(val),target:'_blank',className:'map-btn'},'📍 Open in Maps')):e('div',{className:'jcw-fv'},val))
+      ...[['Job Number',job.jobNumber],['Job Name',farm?farm.name:''],['Job Type',job.type],['Start Date',fmtDate(job.startDate)],['End Date',endD],['Farm Address',farm?farm.address:'',true],['Total Sheep',(job.totalSheep||0).toLocaleString()],['EVOs',job.evos],['Crutching Trailer',job.crutchingTrailer?'Provided':'Not provided'],['Meals',job.meals||'Not Supplied'],['Transport',job.transport?'Available':'No'],['Accommodation',job.accommodation]].map(([lbl,val,isAddr])=>
+        e('div',{key:lbl,className:'jcw-f'},e('div',{className:'jcw-fl'},lbl),isAddr?e('div',null,e('div',{className:'jcw-fv'},val),e('a',{href:/^https?:\/\//i.test(val||'')?val:'https://maps.google.com/?q='+encodeURIComponent(val||''),target:'_blank',className:'map-btn'},'📍 Open in Maps')):e('div',{className:'jcw-fv'},val))
       ),
       job.notes_job&&e('div',{className:'jcw-f'},e('div',{className:'jcw-fl'},'Further Details'),e('div',{className:'jcw-fv',style:{fontSize:'14px',color:'#444'}},job.notes_job)),
       e('div',{className:'jcw-f'},e('div',{className:'jcw-fl'},'Your Team'),team.map(c=>e('div',{key:c.id,className:'team-item'},e('div',{style:{width:36,height:36,borderRadius:'50%',background:avc(c.name).bg,color:avc(c.name).fg,display:'flex',alignItems:'center',justifyContent:'center',fontFamily:'var(--h)',fontSize:'14px',fontWeight:'700',flexShrink:0}},init(c.name)),e('div',null,e('div',{className:'ti-name'},c.name),e('div',{className:'ti-role'},getJobRole(job,c.id)||c.role),c.hasVehicle&&e('div',{className:'ti-car'},'🚗 Has a vehicle')))))
@@ -3108,7 +3230,7 @@ function buildJobCardSMS(job,crewId,farmList,crewList,appUrl){
     '',
     jobName+' - '+job.type,
     'Start: '+fmtDate(job.startDate)+'  End: '+fmtDate(endDate),
-    'Sheep: '+job.totalSheep.toLocaleString(),
+    'Sheep: '+(job.totalSheep||0).toLocaleString(),
     farm?'Address: '+farm.address:'',
     '',
     'View job details: '+appUrl+'#job='+job.id+'&crew='+crewId,
@@ -3127,7 +3249,7 @@ function buildFarmerSMS(job,farmerName,farmerPhone,farmList,appUrl){
     '',
     '🐑 '+jobName+' — '+job.type,
     'Start: '+fmtDate(job.startDate)+'  End: '+fmtDate(endDate),
-    'Sheep: '+job.totalSheep.toLocaleString(),
+    'Sheep: '+(job.totalSheep||0).toLocaleString(),
     farm?'Address: '+farm.address:'',
     '',
     '👉 View job details: '+appUrl+'#job='+job.id,
@@ -4202,9 +4324,46 @@ function ScheduleScreen({jobs,role,setRole,onBack,onJob,onNew,onNewDraft}){
 }
 
 /* ── APP ── */
+/* ── ACCESS GATE (v4.6.3d) ── */
+function AccessGate({onSuccess}){
+  const [entry,setEntry]=useState('');
+  const [err,setErr]=useState('');
+  const [busy,setBusy]=useState(false);
+  const handleSubmit=async()=>{
+    if(busy||!entry)return;
+    setBusy(true);setErr('');
+    try{
+      const ok=await checkAccess(entry);
+      if(ok){markAccessVerified();onSuccess();}
+      else{setErr('Incorrect password');setBusy(false);}
+    }catch(e){setErr('Verification error — try again');setBusy(false);}
+  };
+  return e('div',{style:{position:'fixed',inset:0,background:'var(--bg)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:9999,padding:'20px'}},
+    e('div',{style:{maxWidth:'380px',width:'100%',background:'var(--card)',borderRadius:12,padding:'32px 24px',border:'1px solid var(--border)',textAlign:'center'}},
+      e('div',{style:{fontSize:36,marginBottom:12}},'🔒'),
+      e('div',{style:{fontSize:20,fontWeight:700,marginBottom:6}},CONTRACTOR_NAME),
+      e('div',{style:{fontSize:13,color:'var(--muted)',marginBottom:24}},'Enter access password to continue'),
+      e('input',{type:'password',value:entry,autoFocus:true,
+        onChange:ev=>{setEntry(ev.target.value);setErr('');},
+        onKeyDown:ev=>{if(ev.key==='Enter')handleSubmit();},
+        style:{width:'100%',padding:'12px',fontSize:16,borderRadius:8,border:'1px solid '+(err?'#ef4444':'var(--border)'),background:'var(--card2)',color:'var(--text)',marginBottom:8,boxSizing:'border-box'},
+        placeholder:'Password',
+        autoCapitalize:'none',
+        autoCorrect:'off'}),
+      err&&e('div',{style:{color:'#ef4444',fontSize:13,marginBottom:8}},err),
+      e('button',{className:'btn-p',disabled:busy||!entry,onClick:handleSubmit,style:{width:'100%',padding:'12px',fontSize:15,marginTop:8,opacity:busy||!entry?0.5:1}},busy?'Verifying…':'Continue'),
+      e('div',{style:{fontSize:11,color:'var(--muted)',marginTop:20}},'Contact your contractor if you don\'t have the password.')
+    )
+  );
+}
+
 function App(){
   const [appUnlocked,setAppUnlocked]=useState(true);
   const [loading,setLoading]=useState(true);
+  /* v4.6.3d: access gate. accessReady=false means we're still checking; 
+     showGate=true means a hash is set and this device isn't verified yet. */
+  const [accessReady,setAccessReady]=useState(false);
+  const [showGate,setShowGate]=useState(false);
   const [saveStatus,setSaveStatus]=useState('');
   const [isOnline,setIsOnline]=useState(navigator.onLine);
   const [pendingCount,setPendingCount]=useState(0);
@@ -4276,6 +4435,14 @@ function App(){
   /* Load on mount */
   useEffect(()=>{
     loadPins(); /* load PIN hashes from Supabase on mount */
+    /* v4.6.3d: load access password hash, then decide if gate is needed.
+       If we can't load (offline/missing column), and localStorage already has
+       a verified flag from a prior session, we proceed; otherwise gate is
+       skipped (graceful for pre-migration or offline-first-load). */
+    loadAccessHash().then(()=>{
+      if(!isAccessVerified())setShowGate(true);
+      setAccessReady(true);
+    });
     const pendingOnMount=lsGet(LS_QUEUE)||[];
     const mountLoad=()=>dbLoad().then(({jobs:j,farms:f,crew:c,fromCache})=>{
       syncLookups(f,c);
@@ -4779,6 +4946,15 @@ function App(){
       setShowSMS(true);
     }
   };
+
+  /* v4.6.3d: access gate before anything else. Shows while we're still checking
+     (accessReady=false) and stays up if a password is set and not yet verified. */
+  if(!accessReady)return e('div',{style:{height:'100dvh',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16,background:'var(--hdr)'}},
+    e('div',{style:{fontFamily:'var(--h)',fontSize:36,fontWeight:800,color:'var(--amber)'}},'my',e('span',{style:{color:'rgba(255,255,255,.4)',fontWeight:500}},'Gang')),
+    e('div',{style:{width:40,height:40,border:'3px solid rgba(255,255,255,.15)',borderTopColor:'var(--amber)',borderRadius:'50%',animation:'spin 0.8s linear infinite'}}),
+    e('style',null,'@keyframes spin{to{transform:rotate(360deg)}}')
+  );
+  if(showGate)return e(AccessGate,{onSuccess:()=>setShowGate(false)});
 
   /* Loading screen */
   if(loading)return e('div',{style:{height:'100dvh',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16,background:'var(--hdr)'}},
