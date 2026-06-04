@@ -526,7 +526,7 @@ const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.3d.1a-hotfix'; /* v4.6.3d.1a hotfix: Presser hybrid-day pay summary display fix — when a presser had BOTH per-bale days AND per-run days in the same job, the displayed breakdown used totalRuns/totalBales summed across all days, producing math that didn't add up (e.g. "23 bales @ $14.20 = $213" when only 15 bales were actually paid per-bale and the other 8 were on a per-run day). Total earn was always correct; only the readable breakdown was wrong. Fix tracks paidRuns/paidBales separately so the line items match the math. All-bale and all-run cases unchanged. v4.6.3d.1 hotfix: (1) Map link handles goo.gl/Maps URLs as addresses by detecting http(s):// and passing through instead of wrapping in maps.google.com search query; (2) Defensive guard on job.baleWeights access in cpk-mode pay calc (was a crash hazard on old jobs without the field if pressMode was toggled to cpk); (3) Guard all 7 unguarded job.totalSheep.toLocaleString() crash sites with ||0 (was a render crash on any job with undefined totalSheep). v4.6.3d adds per-contractor boot-time access password (hash stored in contractor_settings.access_password_hash, verified flag in localStorage = hash itself for auto-invalidation on rotation, master PIN bypass for SRD support, null hash = no gate for graceful rollout). v4.6.3c-final adds mode badges next to crew names in pay summary + grand-total math check line in CONTRACTOR TOTALS. v4.6.3c adds c/kg presser mode (pressMode toggle + kg tracking via new tally_entries kind='bale_kg') and c/km travel mode (per-person day vs km, with override) — additive. v4.6.3b adds cascade delete from tally_entries on delRun/delMob — fixes zombie runs resurrecting via self-heal (Knights, 28 May). v4.6.3a added MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
+const APP_VERSION='v4.6.3d.1b-hotfix'; /* v4.6.3d.1b CALC HOTFIX: Presser pay calc was iterating only shedTallies dates, which meant days where the presser pressed bales (or kg) WITHOUT entering shed_runs were skipped entirely from pay calculation. Real money bug — e.g. Whitey on Burragundy had 19 bales on Jun 2 with no shed_runs that day, calc never visited Jun 2 → $269.80 missing from his pay. Fix iterates union of shedTallies, baleTallies, baleWeights date keys so all days with any presser activity are evaluated. Applied to both calcPeriodStats (totals) and generateSummary (pay breakdown). All-runs and all-bales cases unchanged. v4.6.3d.1a hotfix: Presser hybrid-day pay summary display fix — when a presser had BOTH per-bale days AND per-run days in the same job, the displayed breakdown used totalRuns/totalBales summed across all days, producing math that didn't add up (e.g. "23 bales @ $14.20 = $213" when only 15 bales were actually paid per-bale and the other 8 were on a per-run day). Total earn was always correct; only the readable breakdown was wrong. Fix tracks paidRuns/paidBales separately so the line items match the math. All-bale and all-run cases unchanged. v4.6.3d.1 hotfix: (1) Map link handles goo.gl/Maps URLs as addresses by detecting http(s):// and passing through instead of wrapping in maps.google.com search query; (2) Defensive guard on job.baleWeights access in cpk-mode pay calc (was a crash hazard on old jobs without the field if pressMode was toggled to cpk); (3) Guard all 7 unguarded job.totalSheep.toLocaleString() crash sites with ||0 (was a render crash on any job with undefined totalSheep). v4.6.3d adds per-contractor boot-time access password (hash stored in contractor_settings.access_password_hash, verified flag in localStorage = hash itself for auto-invalidation on rotation, master PIN bypass for SRD support, null hash = no gate for graceful rollout). v4.6.3c-final adds mode badges next to crew names in pay summary + grand-total math check line in CONTRACTOR TOTALS. v4.6.3c adds c/kg presser mode (pressMode toggle + kg tracking via new tally_entries kind='bale_kg') and c/km travel mode (per-person day vs km, with override) — additive. v4.6.3b adds cascade delete from tally_entries on delRun/delMob — fixes zombie runs resurrecting via self-heal (Knights, 28 May). v4.6.3a added MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
   vectors that survived v4.6.2. The Woolaway incident on 21 May 2026 showed
   three structural gaps even after v4.6.2:
 
@@ -1422,17 +1422,27 @@ function calcPeriodStats(job,period){
     const defR=role==='Wool Classer'?rates.classerPerRun:role==='Penner'?rates.pennerPerRun:role==='Presser'?rates.presserPerRun:rates.woolHandlerPerRun;
     const rpr=ov||defR||80;
     if(role==='Presser'){
-      /* v4.6.3c: cpk mode pays kg × pressCpk; standard mode uses threshold logic */
+      /* v4.6.3c: cpk mode pays kg × pressCpk; standard mode uses threshold logic
+         v4.6.3d.1b: iterate union of shedTallies + baleTallies + baleWeights dates.
+         Previously iterated shedTallies only — days where presser pressed bales
+         (or kg) but didn't record shed_runs were skipped, undercounting earnings. */
       const det=(rates.crewDetails||{})[id]||{};
       const pressMode=det.pressMode||'standard';
-      Object.entries(job.shedTallies[id]||{}).forEach(([date,runs])=>{
+      const allDates=new Set([
+        ...Object.keys(job.shedTallies[id]||{}),
+        ...Object.keys(job.baleTallies[id]||{}),
+        ...Object.keys((job.baleWeights||{})[id]||{}),
+      ]);
+      allDates.forEach(date=>{
         if(!inP(date))return;
+        const runs=(job.shedTallies[id]||{})[date]||0;
         if(pressMode==='cpk'){
           const kg=((job.baleWeights||{})[id]||{})[date]||0;
           totalEarn+=kg*(rates.pressCpk||0);
         }else{
           const bales=((job.baleTallies||{})[id]||{})[date]||0;
-          totalEarn+=bales>(rates.baleThreshold||13)?bales*(rates.presserPerBale||14.20):runs*rpr;
+          if(bales>(rates.baleThreshold||13))totalEarn+=bales*(rates.presserPerBale||14.20);
+          else if(runs>0)totalEarn+=runs*rpr;
         }
       });
     }
@@ -1607,13 +1617,21 @@ function generateSummary(job,period){
     const totalRuns=Object.entries(job.shedTallies[id]||{}).filter(([d])=>inP(d)).reduce((a,[,b])=>a+b,0);
     const travel=trvl(id);let earn=0,earnLine='';
     if(role==='Presser'){
-      /* v4.6.3c: cpk mode pays kg × pressCpk; standard mode keeps threshold logic */
+      /* v4.6.3c: cpk mode pays kg × pressCpk; standard mode keeps threshold logic
+         v4.6.3d.1b: iterate union of dates across shedTallies + baleTallies + baleWeights.
+         Previously iterated shedTallies only — days where presser pressed bales (or kg)
+         but didn't enter shed_runs were skipped entirely, costing the presser real money. */
       const detP=(rates.crewDetails||{})[id]||{};
       const pressMode=detP.pressMode||'standard';
       if(pressMode==='cpk'){
         const cpk=rates.pressCpk||0;
         let totalKg=0,totalBalesC=0;
-        Object.entries(job.shedTallies[id]||{}).forEach(([date])=>{
+        const allDates=new Set([
+          ...Object.keys(job.shedTallies[id]||{}),
+          ...Object.keys((job.baleWeights||{})[id]||{}),
+          ...Object.keys(job.baleTallies[id]||{}),
+        ]);
+        allDates.forEach(date=>{
           if(!inP(date))return;
           totalKg+=((job.baleWeights||{})[id]||{})[date]||0;
           totalBalesC+=((job.baleTallies||{})[id]||{})[date]||0;
@@ -1622,13 +1640,21 @@ function generateSummary(job,period){
         earnLine='  '+totalKg.toFixed(1)+' kg @ $'+cpk.toFixed(2)+'/kg = $'+earn.toFixed(2)+(totalBalesC>0?' ('+totalBalesC+' bales)':'');
       }else{
         /* v4.6.3d.1a: track paidRuns/paidBales separately so the displayed
-           breakdown matches the calc. Previously the hybrid display used
-           totalRuns/totalBales summed across ALL days, which gave nonsense
-           math like "23 bales @ $14.20 = $213" when only 15 of the 23 bales
-           were actually paid per-bale. earn total was always correct; only
-           the readable breakdown was wrong. */
+           breakdown matches the calc.
+           v4.6.3d.1b: iterate union of shedTallies + baleTallies dates so bales-only
+           days (no shed_runs recorded) are no longer skipped. */
         let rEarn=0,bEarn=0,paidRuns=0,paidBales=0;
-        Object.entries(job.shedTallies[id]||{}).forEach(([date,runs])=>{if(!inP(date))return;const bales=(job.baleTallies[id]||{})[date]||0;if(bales>(rates.baleThreshold||13)){bEarn+=bales*(rates.presserPerBale||14.20);paidBales+=bales;}else{rEarn+=runs*rpr;paidRuns+=runs;}});
+        const allDates=new Set([
+          ...Object.keys(job.shedTallies[id]||{}),
+          ...Object.keys(job.baleTallies[id]||{}),
+        ]);
+        allDates.forEach(date=>{
+          if(!inP(date))return;
+          const runs=(job.shedTallies[id]||{})[date]||0;
+          const bales=(job.baleTallies[id]||{})[date]||0;
+          if(bales>(rates.baleThreshold||13)){bEarn+=bales*(rates.presserPerBale||14.20);paidBales+=bales;}
+          else if(runs>0){rEarn+=runs*rpr;paidRuns+=runs;}
+        });
         earn=rEarn+bEarn;
         if(bEarn>0&&rEarn>0){earnLine='  '+paidRuns+' runs @ $'+rpr.toFixed(2)+'/run = $'+rEarn.toFixed(2)+'\n  '+paidBales+' bales @ $'+(rates.presserPerBale||14.20).toFixed(2)+'/bale = $'+bEarn.toFixed(2);}
         else if(bEarn>0){earnLine='  '+paidBales+' bales @ $'+(rates.presserPerBale||14.20).toFixed(2)+'/bale = $'+earn.toFixed(2);}
