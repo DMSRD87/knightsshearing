@@ -879,7 +879,15 @@ async function loadTalliesForJobs(jobIds){
           .eq('contractor_slug',CONTRACTOR_SLUG)
           .in('job_id',jobIds)
           .order('updated_at',{ascending:true})
-          .order('id',{ascending:true})
+          /* tiebreak on real identity columns — tally_entries has NO 'id'
+             column (composite natural key), so ordering by 'id' 400s the whole
+             query and returns zero rows. These columns exist and together make
+             the per-cell order deterministic so .range() paging can't skip or
+             duplicate rows that share an updated_at. */
+          .order('crew_id',{ascending:true})
+          .order('run_id',{ascending:true})
+          .order('cell_date',{ascending:true})
+          .order('kind',{ascending:true})
           .range(from,from+PAGE-1),
         8000,
         'tally_load_timeout'
