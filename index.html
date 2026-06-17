@@ -852,28 +852,59 @@ async function flushTallyMetaQueue(){
    given job ids. Returns rows; caller applies them via hydrateTallies. */
 async function loadTalliesForJobs(jobIds){
   if(!jobIds||!jobIds.length)return [];
+  /* v4.6.4 FIX (Knights 17 Jun): Supabase/PostgREST caps a select at 1000 rows
+     by default. This query fetches cells across ALL of a contractor's jobs at
+     once; once tally_entries passes 1000 rows, the cap silently truncates the
+     result. With order('updated_at' ascending) the OLDEST rows are returned and
+     the NEWEST (today's counts) fall off the end — so recent tallies hydrate as
+     0 even though they're in the table. (The ascending order was added in 4.6.4
+     for mob-metadata last-write-wins; it made the truncation hit recent data
+     specifically.) Fix: page through with .range() until the server returns a
+     SHORT page relative to what we asked for.
+     CAP-INDEPENDENT: we must NOT assume the server returns a full PAGE whenever
+     more rows exist — the project's max-rows can be lower than PAGE (e.g. 500),
+     in which case the first page is already "short" and a naive
+     page.length<PAGE test would stop after one page and under-fetch. So we
+     advance by the number of rows ACTUALLY returned and only stop when a page
+     comes back EMPTY. Ordering by (updated_at,id) keeps paging deterministic and
+     preserves the oldest-first apply order hydrate/self-heal rely on. */
+  const PAGE=1000;
+  const all=[];
   try{
-    const result=await withTimeout(
-      sb.from('tally_entries')
-        .select('job_id,cell_date,kind,run_id,mob_id,crew_id,value,mob_type,mob_desc')
-        .eq('contractor_slug',CONTRACTOR_SLUG)
-        .in('job_id',jobIds)
-        .order('updated_at',{ascending:true}),
-      8000,
-      'tally_load_timeout'
-    );
-    if(result&&result.error){
-      logSaveFailure('error','tally_load',result.error.message);
-      return [];
+    let from=0;
+    for(let guard=0; guard<200; guard++){ /* 200*1000 = 200k cell safety ceiling */
+      const result=await withTimeout(
+        sb.from('tally_entries')
+          .select('job_id,cell_date,kind,run_id,mob_id,crew_id,value,mob_type,mob_desc')
+          .eq('contractor_slug',CONTRACTOR_SLUG)
+          .in('job_id',jobIds)
+          .order('updated_at',{ascending:true})
+          .order('id',{ascending:true})
+          .range(from,from+PAGE-1),
+        8000,
+        'tally_load_timeout'
+      );
+      if(result&&result.error){
+        logSaveFailure('error','tally_load',result.error.message);
+        return all; /* return what we have, not nothing */
+      }
+      const page=result.data||[];
+      if(page.length===0)break;        /* empty page = definitively done */
+      all.push(...page);
+      from+=page.length;               /* advance by ACTUAL rows returned, not PAGE */
+      /* A short page (page.length<PAGE) may mean the last page OR a server cap
+         below PAGE. We don't decide here — we loop again; if it was the last
+         page the next request returns empty and we stop. One extra round-trip,
+         correct for any server max-rows. */
     }
-    return result.data||[];
+    return all;
   }catch(e){
     logSaveFailure(
       e.message==='tally_load_timeout'?'timeout':'error',
       'tally_load',
       e.message
     );
-    return [];
+    return all; /* partial beats a zeroed UI */
   }
 }
 
