@@ -526,8 +526,9 @@ const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
+const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.3g'; /* v4.6.3g RESILIENCE (16 Jun, from Darby/Chloe stuck-queue incident): (1) periodic 20s background drain — browser 'online' event doesn't fire when a flaky connection silently recovers, so queued cells could sit unflushed until manual reopen; timer retries whenever online+fresh+queue non-empty (no-op when empty). (2) poison-pill quarantine — flushTallyQueue now separates PERMANENT rejections (constraint/validation, will never succeed) from TRANSIENT (timeout/network); permanent rows move to LS_TALLY_DEAD instead of pinning the queue + banner forever. (3) dead-letter replay on boot — quarantined cells get one retry per launch, so a since-fixed server blocker (e.g. the 'mess' kind constraint widened 15 Jun) self-recovers without re-entry. (4) sundries load resilient to missing table — sets a session flag on first 'table not found' and stops re-querying, ending per-load error spam when the migration hasn't run. NOTE: the tally_entries kind_check constraint MUST include every kind the build writes (count,shed_runs,bales,bale_kg,travel,mess) and sundries_entries MUST exist BEFORE deploy — both are hard prerequisites. v4.6.3f FEATURES (builds on v4.6.3e — deploy ONLY after 3e soak is clean): (1) MESS RATE — per-person $/day deduction; 3-state per-day toggle on Tally tab (Off ◯ / Half ½ / Full ●) stored as tally_entries kind='mess' multiplier 0/0.5/1 with run_id=mob_id=''; rate = crewDetails[id].messRate override else role default $35 shearer/crutcher $10 staff (resolveMessRate); Admin tab Mess Rate section; pay summary line 'Mess: N full + M half x $R/day = -$T'. (2) SUNDRIES — itemised per-person deductions in NEW sundries_entries table (run schema SQL BEFORE deploying this file); lead adds, admin edits/deletes via Summary-tab panel; pay summary itemises with subtotal. Both deduct POST-tax: GROSS → tax → mess → sundries → NET TOTAL. CONTRACTOR TOTALS gains conditional deduction lines + NET JOB TOTAL; math check extends through net when deductions exist. REGRESSION GUARANTEE: jobs with zero mess + zero sundries produce byte-identical pay output to v4.6.3e. calcPeriodStats now returns {shorn,totalEarn,messDeduction,sundriesDeduction,netEarn} — totalEarn stays gross. v4.6.3e SAFETY RELEASE (6 Jun 2026, after Knights/Bywong double incident): (1) delRun/delMob cascade deletes now scoped to cell_date=viewDate — run_id-only delete destroyed same-run cells on OTHER dates; (2) dbLoad merge now consults LS_TALLY_QUEUE as well as LS_QUEUE — a day of offline cells + silently-failed flush previously let the server's empty hydration overwrite the local day ("worked all day, lost it at night"); because flushTallyQueue retains only failed rows, post-flush queue state doubles as the flush-success gate; (3) jobDates guarantees today (Active jobs) and every date with existing data appear in the strip regardless of includeWeekends — weekend work was silently landing on the last visible weekday via defDate fallback; (4) new tappable banner when online+fresh but queued entries remain ("N entries not yet on server — tap to retry. Don't clear app data") — closes the silent state that drove users to clear site data and destroy the only copy. NO pay calc changes. v4.6.3d.1b CALC HOTFIX: Presser pay calc was iterating only shedTallies dates, which meant days where the presser pressed bales (or kg) WITHOUT entering shed_runs were skipped entirely from pay calculation. Real money bug — e.g. Whitey on Burragundy had 19 bales on Jun 2 with no shed_runs that day, calc never visited Jun 2 → $269.80 missing from his pay. Fix iterates union of shedTallies, baleTallies, baleWeights date keys so all days with any presser activity are evaluated. Applied to both calcPeriodStats (totals) and generateSummary (pay breakdown). All-runs and all-bales cases unchanged. v4.6.3d.1a hotfix: Presser hybrid-day pay summary display fix — when a presser had BOTH per-bale days AND per-run days in the same job, the displayed breakdown used totalRuns/totalBales summed across all days, producing math that didn't add up (e.g. "23 bales @ $14.20 = $213" when only 15 bales were actually paid per-bale and the other 8 were on a per-run day). Total earn was always correct; only the readable breakdown was wrong. Fix tracks paidRuns/paidBales separately so the line items match the math. All-bale and all-run cases unchanged. v4.6.3d.1 hotfix: (1) Map link handles goo.gl/Maps URLs as addresses by detecting http(s):// and passing through instead of wrapping in maps.google.com search query; (2) Defensive guard on job.baleWeights access in cpk-mode pay calc (was a crash hazard on old jobs without the field if pressMode was toggled to cpk); (3) Guard all 7 unguarded job.totalSheep.toLocaleString() crash sites with ||0 (was a render crash on any job with undefined totalSheep). v4.6.3d adds per-contractor boot-time access password (hash stored in contractor_settings.access_password_hash, verified flag in localStorage = hash itself for auto-invalidation on rotation, master PIN bypass for SRD support, null hash = no gate for graceful rollout). v4.6.3c-final adds mode badges next to crew names in pay summary + grand-total math check line in CONTRACTOR TOTALS. v4.6.3c adds c/kg presser mode (pressMode toggle + kg tracking via new tally_entries kind='bale_kg') and c/km travel mode (per-person day vs km, with override) — additive. v4.6.3b adds cascade delete from tally_entries on delRun/delMob — fixes zombie runs resurrecting via self-heal (Knights, 28 May). v4.6.3a added MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
+const APP_VERSION='v4.6.4'; /* v4.6.4 STRUCTURAL (16 Jun, after Knights crutching->shearing flip). ROOT CAUSE of the recurring job-type-flip class: mob type/desc lived ONLY in jobs.data (no authoritative store); on a flaky-signal device per-cell writes reached tally_entries but the blob structure desynced, then self-heal rebuilt the missing mobs from cells and INVENTED type=Shearing/desc=blank because it had no metadata to read - silently tripling crutching pay ($1.65->$4.80/head). hydrateTallies corrected counts from the table but never type/desc, so corruption persisted and rode the next save up. FIX (mirrors how counts are already safe): (a) tally_entries gains mob_type/mob_desc; count writes carry them; (b) hydrateTallies is now AUTHORITATIVE for type/desc - a corrupted blob from any device is overwritten from row metadata on load, exactly as counts are; (c) self-heal reconstructs synthesized mobs faithfully from row metadata instead of hardcoded Shearing/blank (legacy-null rows fall back to job type and set _synth to flag the guess); (d) post-hoc type/desc edits back-propagate to existing cells (updateMobMeta + LS_TALLY_META_QUEUE + flushTallyMetaQueue) so an edit after counts exist isn't reverted on next hydrate. PREREQUISITE: run v4.6.4-migration.sql FIRST (two nullable columns + backfill from current/corrected blobs), THEN deploy. Legacy null-metadata rows behave as pre-v4.6.4 until the next entry/edit repopulates them; no regression. v4.6.3g RESILIENCE (16 Jun, from Darby/Chloe stuck-queue incident): (1) periodic 20s background drain — browser 'online' event doesn't fire when a flaky connection silently recovers, so queued cells could sit unflushed until manual reopen; timer retries whenever online+fresh+queue non-empty (no-op when empty). (2) poison-pill quarantine — flushTallyQueue now separates PERMANENT rejections (constraint/validation, will never succeed) from TRANSIENT (timeout/network); permanent rows move to LS_TALLY_DEAD instead of pinning the queue + banner forever. (3) dead-letter replay on boot — quarantined cells get one retry per launch, so a since-fixed server blocker (e.g. the 'mess' kind constraint widened 15 Jun) self-recovers without re-entry. (4) sundries load resilient to missing table — sets a session flag on first 'table not found' and stops re-querying, ending per-load error spam when the migration hasn't run. NOTE: the tally_entries kind_check constraint MUST include every kind the build writes (count,shed_runs,bales,bale_kg,travel,mess) and sundries_entries MUST exist BEFORE deploy — both are hard prerequisites. v4.6.3f FEATURES (builds on v4.6.3e — deploy ONLY after 3e soak is clean): (1) MESS RATE — per-person $/day deduction; 3-state per-day toggle on Tally tab (Off ◯ / Half ½ / Full ●) stored as tally_entries kind='mess' multiplier 0/0.5/1 with run_id=mob_id=''; rate = crewDetails[id].messRate override else role default $35 shearer/crutcher $10 staff (resolveMessRate); Admin tab Mess Rate section; pay summary line 'Mess: N full + M half x $R/day = -$T'. (2) SUNDRIES — itemised per-person deductions in NEW sundries_entries table (run schema SQL BEFORE deploying this file); lead adds, admin edits/deletes via Summary-tab panel; pay summary itemises with subtotal. Both deduct POST-tax: GROSS → tax → mess → sundries → NET TOTAL. CONTRACTOR TOTALS gains conditional deduction lines + NET JOB TOTAL; math check extends through net when deductions exist. REGRESSION GUARANTEE: jobs with zero mess + zero sundries produce byte-identical pay output to v4.6.3e. calcPeriodStats now returns {shorn,totalEarn,messDeduction,sundriesDeduction,netEarn} — totalEarn stays gross. v4.6.3e SAFETY RELEASE (6 Jun 2026, after Knights/Bywong double incident): (1) delRun/delMob cascade deletes now scoped to cell_date=viewDate — run_id-only delete destroyed same-run cells on OTHER dates; (2) dbLoad merge now consults LS_TALLY_QUEUE as well as LS_QUEUE — a day of offline cells + silently-failed flush previously let the server's empty hydration overwrite the local day ("worked all day, lost it at night"); because flushTallyQueue retains only failed rows, post-flush queue state doubles as the flush-success gate; (3) jobDates guarantees today (Active jobs) and every date with existing data appear in the strip regardless of includeWeekends — weekend work was silently landing on the last visible weekday via defDate fallback; (4) new tappable banner when online+fresh but queued entries remain ("N entries not yet on server — tap to retry. Don't clear app data") — closes the silent state that drove users to clear site data and destroy the only copy. NO pay calc changes. v4.6.3d.1b CALC HOTFIX: Presser pay calc was iterating only shedTallies dates, which meant days where the presser pressed bales (or kg) WITHOUT entering shed_runs were skipped entirely from pay calculation. Real money bug — e.g. Whitey on Burragundy had 19 bales on Jun 2 with no shed_runs that day, calc never visited Jun 2 → $269.80 missing from his pay. Fix iterates union of shedTallies, baleTallies, baleWeights date keys so all days with any presser activity are evaluated. Applied to both calcPeriodStats (totals) and generateSummary (pay breakdown). All-runs and all-bales cases unchanged. v4.6.3d.1a hotfix: Presser hybrid-day pay summary display fix — when a presser had BOTH per-bale days AND per-run days in the same job, the displayed breakdown used totalRuns/totalBales summed across all days, producing math that didn't add up (e.g. "23 bales @ $14.20 = $213" when only 15 bales were actually paid per-bale and the other 8 were on a per-run day). Total earn was always correct; only the readable breakdown was wrong. Fix tracks paidRuns/paidBales separately so the line items match the math. All-bale and all-run cases unchanged. v4.6.3d.1 hotfix: (1) Map link handles goo.gl/Maps URLs as addresses by detecting http(s):// and passing through instead of wrapping in maps.google.com search query; (2) Defensive guard on job.baleWeights access in cpk-mode pay calc (was a crash hazard on old jobs without the field if pressMode was toggled to cpk); (3) Guard all 7 unguarded job.totalSheep.toLocaleString() crash sites with ||0 (was a render crash on any job with undefined totalSheep). v4.6.3d adds per-contractor boot-time access password (hash stored in contractor_settings.access_password_hash, verified flag in localStorage = hash itself for auto-invalidation on rotation, master PIN bypass for SRD support, null hash = no gate for graceful rollout). v4.6.3c-final adds mode badges next to crew names in pay summary + grand-total math check line in CONTRACTOR TOTALS. v4.6.3c adds c/kg presser mode (pressMode toggle + kg tracking via new tally_entries kind='bale_kg') and c/km travel mode (per-person day vs km, with override) — additive. v4.6.3b adds cascade delete from tally_entries on delRun/delMob — fixes zombie runs resurrecting via self-heal (Knights, 28 May). v4.6.3a added MOB TOTALS section to pay summary - additive only, no data model change from v4.6.3. v4.6.3 closes the data-loss
   vectors that survived v4.6.2. The Woolaway incident on 21 May 2026 showed
   three structural gaps even after v4.6.2:
 
@@ -709,7 +710,7 @@ function queueTallyCell(row){
 
 /* writeTallyCell — upserts a single cell to Supabase, or queues it if offline.
    This is fired on every tally-cell change. No debounce; the volume is fine. */
-async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value}){
+async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value,mobType,mobDesc}){
   const row={
     contractor_slug:CONTRACTOR_SLUG,
     job_id:jobId,
@@ -721,6 +722,16 @@ async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value}){
     value:value,
     updated_at:new Date().toISOString()
   };
+  /* v4.6.4 — carry mob metadata on count rows so tally_entries is the source
+     of truth for mob type/desc, not just counts. This closes the Shearing-flip
+     class (Knights 16 Jun): self-heal previously had to invent type='Shearing'
+     because metadata had no authoritative home. Only count rows carry a mob;
+     other kinds leave these null. mobType is NOT NULL-constrained out — a
+     legitimately-empty desc is '' not null. */
+  if(kind==='count'){
+    if(mobType!=null)row.mob_type=mobType;
+    if(mobDesc!=null)row.mob_desc=mobDesc;
+  }
   if(!navigator.onLine){
     queueTallyCell(row);
     return;
@@ -797,6 +808,46 @@ async function flushTallyQueue(){
   return flushed;
 }
 
+/* v4.6.4 — flushTallyMetaQueue: drains queued mob metadata (type/desc) updates
+   to existing count cells. Separate from the cell-value queue because these are
+   bulk UPDATEs keyed on mob_id, not per-cell upserts. Idempotent: re-applying
+   the same patch is harmless. Failures re-queue (transient) and are retried by
+   the same paths that call flushTallyQueue. Capped to avoid unbounded growth. */
+async function flushTallyMetaQueue(){
+  const q=lsGet(LS_TALLY_META_QUEUE)||[];
+  if(!q.length)return 0;
+  let flushed=0;
+  const failed=[];
+  for(const item of q){
+    if(!item||!item.mob_id||!item.patch){flushed++;continue;}
+    try{
+      const r=await withTimeout(
+        sb.from('tally_entries').update(item.patch)
+          .eq('contractor_slug',CONTRACTOR_SLUG).eq('job_id',item.job_id)
+          .eq('mob_id',item.mob_id).eq('kind','count'),
+        5000,'meta_flush_timeout');
+      if(r&&r.error){
+        const msg=r.error.message||'';
+        /* permanent (column missing etc.) — drop rather than pin the queue;
+           metadata is non-critical vs the cell value and will be re-supplied
+           on the next type/desc edit. Log so it's visible SRD-side. */
+        if(/column .* does not exist|invalid input/i.test(msg)){
+          logSaveFailure('error','meta_flush_dropped:'+item.job_id+':'+item.mob_id,msg);
+          flushed++;
+        }else{
+          failed.push(item);
+          logSaveFailure('error','meta_flush:'+item.job_id+':'+item.mob_id,msg);
+        }
+      }else{flushed++;}
+    }catch(e){
+      failed.push(item);
+      logSaveFailure(e.message==='meta_flush_timeout'?'timeout':'error','meta_flush:'+item.job_id+':'+item.mob_id,e.message);
+    }
+  }
+  lsSet(LS_TALLY_META_QUEUE,failed.slice(-500));
+  return flushed;
+}
+
 /* loadTalliesForJobs — single query fetching all tally_entries for the
    given job ids. Returns rows; caller applies them via hydrateTallies. */
 async function loadTalliesForJobs(jobIds){
@@ -804,9 +855,10 @@ async function loadTalliesForJobs(jobIds){
   try{
     const result=await withTimeout(
       sb.from('tally_entries')
-        .select('job_id,cell_date,kind,run_id,mob_id,crew_id,value')
+        .select('job_id,cell_date,kind,run_id,mob_id,crew_id,value,mob_type,mob_desc')
         .eq('contractor_slug',CONTRACTOR_SLUG)
-        .in('job_id',jobIds),
+        .in('job_id',jobIds)
+        .order('updated_at',{ascending:true}),
       8000,
       'tally_load_timeout'
     );
@@ -860,6 +912,15 @@ function hydrateTallies(job,tallyRows){
       const mob=(run.mobs||[]).find(m=>m.id===row.mob_id);
       if(!mob)return;
       mob.counts[row.crew_id]=v;
+      /* v4.6.4 — tally_entries is now authoritative for mob type/desc, not just
+         counts. A corrupted blob arriving from any device (e.g. Knights 16 Jun
+         Shearing-flip) is overwritten here from the row metadata, exactly as the
+         counts already are. Only apply when the row actually carries metadata —
+         legacy rows written before v4.6.4 have mob_type==null, and for those we
+         keep whatever the blob structure says (no worse than pre-v4.6.4). A
+         blank desc IS a real value ('') and is allowed to win; a null is not. */
+      if(row.mob_type!=null&&row.mob_type!=='')mob.type=row.mob_type;
+      if(row.mob_desc!=null)mob.desc=row.mob_desc;
     }else if(row.kind==='shed_runs'){
       if(!job.shedTallies[row.crew_id])job.shedTallies[row.crew_id]={};
       job.shedTallies[row.crew_id][row.cell_date]=v;
@@ -933,9 +994,14 @@ async function dbLoad(){
        orphaned: present in the DB, invisible in the UI. This happens when
        a stale device wrote a truncated runs structure (the Woolaway 21 May
        incident). Synthesize the missing run/mob entries from tally_entries
-       so the orphan data renders. Synthesized mobs have empty desc and
-       default type='Shearing' — the user can edit labels later. The
-       hydrated counts are correct because they came from tally_entries. */
+       so the orphan data renders.
+       v4.6.4 — synthesized mobs now take type/desc from the row metadata
+       (mob_type/mob_desc) instead of the old hardcoded type='Shearing'/desc:''.
+       That hardcode was the Knights 16 Jun Shearing-flip: a crutching mob
+       rebuilt by self-heal silently became a $4.80 shearing mob. Faithful
+       reconstruction removes the invention. Fallbacks (j.type, '') only apply
+       to legacy rows with null metadata; a mob synthesized purely from legacy
+       rows is flagged via _synth so the UI/operator knows the label is a guess. */
     result.jobs.forEach(j=>{
       const rows=byJob[j.id]||[];
       if(!rows.length)return;
@@ -954,9 +1020,22 @@ async function dbLoad(){
         if(!run.mobs)run.mobs=[];
         let mob=run.mobs.find(m=>m.id===row.mob_id);
         if(!mob){
-          mob={id:row.mob_id,desc:'',type:'Shearing',counts:{}};
+          const hasMeta=(row.mob_type!=null&&row.mob_type!=='');
+          mob={
+            id:row.mob_id,
+            desc:(row.mob_desc!=null?row.mob_desc:''),
+            type:(hasMeta?row.mob_type:(j.type||'Shearing')),
+            counts:{}
+          };
+          if(!hasMeta)mob._synth=true; /* label is a fallback guess, not from data */
           run.mobs.push(mob);
           healed++;
+        }else{
+          /* mob already present (from blob or earlier row) — rows are applied
+             oldest-first, so let newer non-null metadata correct it, matching
+             hydrate's authoritative behaviour. */
+          if(row.mob_type!=null&&row.mob_type!=='')mob.type=row.mob_type;
+          if(row.mob_desc!=null)mob.desc=row.mob_desc;
         }
         /* Counts already populated by hydrateTallies — don't overwrite */
         if(mob.counts[row.crew_id]==null){
@@ -1061,7 +1140,9 @@ function buildStrippedJobBlob(job){
         date,
         (dayRuns||[]).map(run=>({
           ...run,
-          mobs:(run.mobs||[]).map(mob=>({...mob,counts:{}}))
+          /* v4.6.4 — strip _synth (transient self-heal "label is a guess" marker)
+             so it never lands in the persisted blob; counts emptied as before. */
+          mobs:(run.mobs||[]).map(mob=>{const {_synth,...m}=mob;return {...m,counts:{}};})
         }))
       ])
     );
@@ -2310,13 +2391,55 @@ function TallyTab({job,setJob,role,viewDate,setViewDate}){
     }
     setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).filter(m=>m.id!==mid)}:run));
   };
-  const setMobDesc=(rid,mid,v)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,desc:v}:m)}:run));
-  const setMobType=(rid,mid,t)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,type:t}:m)}:run));
+  /* v4.6.4 — when a mob's desc/type is edited AFTER counts exist, the count
+     rows in tally_entries still carry the OLD metadata. Since hydrate is now
+     authoritative for type/desc (reads them back from the rows), an un-propagated
+     edit would be silently reverted on next load. So push the new metadata onto
+     every existing count cell for this mob, across all dates. updateMobMeta is
+     fire-and-forget + queue-on-fail, same discipline as writeTallyCell. */
+  const updateMobMeta=(mid,patch)=>{
+    if(!navigator.onLine){
+      /* offline: the next count write for this mob will carry fresh metadata;
+         queue a metadata-only marker so a re-entry isn't required to propagate. */
+      try{
+        const q=lsGet(LS_TALLY_META_QUEUE)||[];
+        q.push({job_id:job.id,mob_id:mid,patch,at:new Date().toISOString()});
+        lsSet(LS_TALLY_META_QUEUE,q.slice(-500));
+      }catch(e){}
+      return;
+    }
+    (async()=>{
+      try{
+        const r=await withTimeout(
+          sb.from('tally_entries').update(patch)
+            .eq('contractor_slug',CONTRACTOR_SLUG).eq('job_id',job.id)
+            .eq('mob_id',mid).eq('kind','count'),
+          5000,'meta_update_timeout');
+        if(r&&r.error)throw new Error(r.error.message);
+      }catch(e){
+        try{
+          const q=lsGet(LS_TALLY_META_QUEUE)||[];
+          q.push({job_id:job.id,mob_id:mid,patch,at:new Date().toISOString()});
+          lsSet(LS_TALLY_META_QUEUE,q.slice(-500));
+        }catch(_){}
+        logSaveFailure(e.message==='meta_update_timeout'?'timeout':'error','meta_update:'+job.id+':'+mid,e.message);
+      }
+    })();
+  };
+  const setMobDesc=(rid,mid,v)=>{setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,desc:v}:m)}:run));updateMobMeta(mid,{mob_desc:v});};
+  const setMobType=(rid,mid,t)=>{setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,type:t}:m)}:run));updateMobMeta(mid,{mob_type:t});};
   const setMobRate=(rid,mid,v)=>setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,rateOverride:v===''?null:parseFloat(v)||null}:m)}:run));
   const setMobCnt=(rid,mid,cid,v)=>{
     const val=parseInt(v)||0;
     setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,counts:{...m.counts,[cid]:val}}:m)}:run));
-    writeTallyCell({jobId:job.id,kind:'count',runId:rid,mobId:mid,crewId:cid,date:viewDate,value:val});
+    /* v4.6.4 — pass the mob's current type/desc so the cell write carries the
+       metadata to tally_entries (source of truth). dayRuns is the in-scope
+       per-day array in TallyTab (NOT 'runs' — that var doesn't exist here;
+       referencing it threw a ReferenceError that silently killed the cell
+       write — Kimba first-deploy, 17 Jun). */
+    const _run=(dayRuns||[]).find(r=>r.id===rid);
+    const _mob=_run?mobsOf(_run).find(m=>m.id===mid):null;
+    writeTallyCell({jobId:job.id,kind:'count',runId:rid,mobId:mid,crewId:cid,date:viewDate,value:val,mobType:_mob?_mob.type:null,mobDesc:_mob?(_mob.desc||''):null});
   };
   const setShed=(cid,v)=>{
     const val=Math.max(0,v);
@@ -4954,7 +5077,7 @@ function App(){
       }
       const pendingTally=lsGet(LS_TALLY_QUEUE)||[];
       if((pendingOnMount.length>0||pendingTally.length>0)&&navigator.onLine){
-        Promise.all([flushQueue().catch(()=>0),flushTallyQueue().catch(()=>0)])
+        Promise.all([flushQueue().catch(()=>0),flushTallyQueue().catch(()=>0),flushTallyMetaQueue().catch(()=>0)])
           .then(()=>mountLoad()).catch(()=>mountLoad());
       } else {
         mountLoad();
@@ -4983,7 +5106,7 @@ function App(){
       const pendingTallyOnMount=lsGet(LS_TALLY_QUEUE)||[];
       if((pendingOnMount.length>0||pendingTallyOnMount.length>0)&&navigator.onLine){
         /* Try queue flushes first */
-        Promise.all([flushQueue().catch(()=>0),flushTallyQueue().catch(()=>0)])
+        Promise.all([flushQueue().catch(()=>0),flushTallyQueue().catch(()=>0),flushTallyMetaQueue().catch(()=>0)])
           .then(()=>performWipe()).catch(()=>performWipe());
       }else if(pendingOnMount.length>0||pendingTallyOnMount.length>0){
         /* Have queue but offline — defer wipe, just proceed */
@@ -5046,6 +5169,7 @@ function App(){
       /* v4.6.0 — also flush the per-cell tally queue. Independent of whole-job
          queue. Any cells typed while offline land in Supabase now. */
       const nTally=await flushTallyQueue().catch(()=>0);
+      await flushTallyMetaQueue().catch(()=>0); /* v4.6.4 — propagate any queued mob type/desc edits */
       if(nTally>0)logSaveFailure('diag_save','goOnline_tally_flushed','count='+nTally);
       const remaining=(lsGet(LS_QUEUE)||[]).length+(lsGet(LS_TALLY_QUEUE)||[]).length;
       setPendingCount(remaining);
@@ -5131,6 +5255,7 @@ function App(){
       try{
         const before=qLen;
         const nt=await flushTallyQueue().catch(()=>0);
+        await flushTallyMetaQueue().catch(()=>0); /* v4.6.4 — drain queued mob metadata edits on the same timer */
         const after=(lsGet(LS_TALLY_QUEUE)||[]).length;
         const pend=after+(lsGet(LS_QUEUE)||[]).length;
         setPendingCount(pend);
