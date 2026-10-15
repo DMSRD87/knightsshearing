@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73';
+const APP_VERSION='v4.6.73a';
+/* v4.6.73a (15 Oct 2026) = v4.6.73 (Xero push, Knights pilot) + the fleet 72b/72c additions: CREW + FARMER SMS TRIM to Dale's wording (both 2 GSM-7 segments; job detail stays behind the link) and PAY-DAY REMINDER on the home board for lead + admin the day before and on pay day (resolves like Pay Week; end-of-shed payers never see it; dismiss hides until the next pay date). UI + SMS text only - no pay, sync, DB or settings change. Xero push unchanged. */
 /* v4.6.72a (6 Oct 2026): nudge bar no longer hides the home-board buttons - while it shows, the fab-stack lifts clear of it (body.a2hs-on). Shed-name placeholder neutralised to 'e.g. Hilltop' (leak list - old value was a real station name). UI only - no pay, sync or data change. */
 /* v4.6.72 (6 Oct 2026): ADD-TO-HOME-SCREEN NUDGE on the home board. Browser-tab only, phones only, never for farmers; dismiss once = never again on that device; Android Chrome gets a one-tap Install. UI only - no pay, sync, DB or settings change. Built on live v4.6.70; v4.6.71 is the Xero TEST build (Quality only) and is NOT included. */
 const SUPER_RATE=0.12; /* SG rate, 12% from 1 Jul 2025. One-line change if legislated rate moves. */
@@ -7480,20 +7481,16 @@ function buildJobCardSMS(job,crewId,farmList,crewList,appUrl){
      Contractor name used ONCE (not twice) to hold the 2-segment ceiling even for long
      names. GSM-7 only — never introduce emoji or em-dash here (em-dash forces UCS-2 and
      doubles the bill). Full job detail lives behind the link, not in the SMS. */
+  /* v4.6.72b — TRIMMED to Dale's wording (7 Oct 2026). Two segments including the lead
+     line; the old body ran to three for a lead. GSM-7 strictly: no emoji, no em-dash. */
   return [
-    'Hi '+crew.name.split(' ')[0]+', you have been added to a job with '+CONTRACTOR_NAME+' starting '+fmtDate(job.startDate)+'.',
-    '',
-    'Open the link to view the job:',
+    'Hi '+crew.name.split(' ')[0]+', you have been added to a job with '+CONTRACTOR_NAME+' starting '+fmtDate(job.startDate)+'. Tap the link for details:',
     appUrl+'/?job='+job.id+'&crew='+crewId, /* v4.6.11f - query not fragment: fragments are stripped by Android PWA intent launches and some SMS linkifiers */
-    '',
-    /* v4.6.13 — lead block goes ONLY to the designated lead, so the extra segment is one
-       message per job, not one per crew member. GSM-7 strictly: no emoji, no em-dash. */
+    /* v4.6.13 — lead line goes ONLY to the designated lead. */
     ...((job.leadId&&job.leadId===crewId&&crew.pin)?[
-      'You are the shed lead for this job.',
-      'In the app tap Lead (top right) and enter your PIN: '+crew.pin,
-      ''
+      'You are shed lead - tap Lead in the app, PIN '+crew.pin
     ]:[]),
-    'Please do not reply to this text - contact us directly with any questions.'
+    'Do not reply to this text - contact us directly.'
   ].join('\n');
 }
 
@@ -7502,21 +7499,14 @@ function buildFarmerSMS(job,farmerName,farmerPhone,farmList,appUrl){
   const jobName=job.jobName||(farm?farm.name:'Farm');
   const jds=jobDates(job,{calendar:true}); /* v4.6.56 — nor the farmer */
   const endDate=jds.length?jds[jds.length-1]:job.startDate;
+  /* v4.6.72b — TRIMMED to Dale's wording (7 Oct 2026): the job detail lives behind the
+     link (same teaser principle as the crew text). Two segments. Plain ASCII only: this
+     whole body must stay GSM-7 or Twilio bills every segment at UCS-2 rates. */
   return [
-    'Hi '+farmerName+'! '+CONTRACTOR_NAME+' has you scheduled for shearing.',
-    '',
-    jobName+' - '+job.type,
-    'Start: '+fmtDate(job.startDate)+'  End: '+fmtDate(endDate),
-    'Sheep: '+(job.totalSheep||0).toLocaleString(),
-    farm?'Address: '+farm.address:'',
-    '',
-    'View job details: '+appUrl+'/?job='+job.id+'&crew=farmer.'+job.farmId, /* v4.6.11f - query not fragment */ /* v4.6.11c - farmer identity so the tap writes a job_views receipt via the existing deep-link handler */
-    '',
-    /* v4.6.15 - farmer PIN rides with the card. Plain ASCII only: this whole body
-       must stay GSM-7 or Twilio bills every segment at UCS-2 rates. */
-    (farm&&farm.farmerPin)?('Your PIN: '+farm.farmerPin+' - open the link, tap Farmer, see all your sheds.'):'',
-    'Questions? Call or reply to this message.',
-    '- '+CONTRACTOR_NAME+' via myGang'
+    'Hi '+(String(farmerName||'').split(' ')[0]||'there')+', '+CONTRACTOR_NAME+' have your shearing locked in. Tap the link to see details:',
+    appUrl+'/?job='+job.id+'&crew=farmer.'+job.farmId, /* v4.6.11f - query not fragment */ /* v4.6.11c - farmer identity so the tap writes a job_views receipt via the existing deep-link handler */
+    /* v4.6.15 - farmer PIN rides with the card. */
+    (farm&&farm.farmerPin)?('Hit Farmer - PIN '+farm.farmerPin):''
   ].filter(l=>l!==null&&l!=='').join('\n');
 }
 
@@ -8712,6 +8702,7 @@ function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule
 
   return e('div',null,
     e(TopBar,{role,setRole,onSchedule}),
+    e(PayDayNudge,{jobs:allJobs,role}), /* v4.6.72c - under the header, above the stats card */
     /* v4.6.11 - FARMER VIEW: farmer devices see only their farm's jobs */
     role==='farmer'&&e('div',{style:{position:'fixed',top:58,left:0,right:0,bottom:0,background:'var(--bg)',zIndex:150,overflowY:'auto',WebkitOverflowScrolling:'touch',padding:'16px'}},
       (function(){
@@ -9681,6 +9672,45 @@ function a2hsEnv(){
   const ios=/iPad|iPhone|iPod/.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
   const android=/Android/i.test(ua);
   return {standalone,ios,android};
+}
+/* ── v4.6.72c PAY-DAY REMINDER ──
+   Pay runs off what is on the server, so the day before and on pay day the lead and
+   admin get one bar on the home board: enter and sync tallies. Pay day resolves the
+   same way Pay Week does (contractor default_rates -> latest non-draft job -> Friday).
+   End-of-shed payers never see it. Fortnightly payers see it every week - a weekly
+   sync reminder costs nothing and the fortnight anchor is not known client-side.
+   Dismiss hides it until the next pay date (LS_PAYDAY_DISMISSED holds that date). */
+const LS_PAYDAY_DISMISSED='mg_payday_dismissed_'+CONTRACTOR_SLUG;
+function resolvePayDay(jobs){
+  const dflt=lsGet(LS_DEFAULT_RATES)||{};
+  const srcJob=(jobs||[]).filter(j=>j&&j.rates&&j.rates.payDayOfWeek!=null&&j.status!=='Draft')
+    .sort((a,b)=>String(b.startDate||'').localeCompare(String(a.startDate||'')))[0];
+  const src=srcJob?srcJob.rates:{};
+  const pd=dflt.payDayOfWeek!=null?dflt.payDayOfWeek:(src.payDayOfWeek!=null?src.payDayOfWeek:5);
+  const fq=dflt.payFrequency||src.payFrequency||'weekly';
+  return {pd,fq};
+}
+function PayDayNudge({jobs,role}){
+  const [dismissedFor,setDismissedFor]=useState(()=>lsGet(LS_PAYDAY_DISMISSED)||'');
+  if(role!=='admin'&&role!=='shed_lead')return null;
+  const {pd,fq}=resolvePayDay(jobs);
+  if(fq==='shed')return null;
+  const todayStr=localToday();
+  const [y,m,d]=todayStr.split('-').map(Number);
+  const dow=new Date(y,m-1,d).getDay();
+  const until=(pd-dow+7)%7; /* 0 = today, 1 = tomorrow */
+  if(until>1)return null;
+  const payDate=addDays(todayStr,until);
+  if(dismissedFor===payDate)return null;
+  const dismiss=()=>{lsSet(LS_PAYDAY_DISMISSED,payDate);setDismissedFor(payDate);};
+  return e('div',{style:{margin:'10px 16px 0',padding:'10px 12px',borderRadius:10,background:'var(--card)',border:'2px solid var(--amber)',display:'flex',alignItems:'center',gap:10,fontSize:14,lineHeight:1.3}},
+    e('span',{style:{fontFamily:'var(--h)',fontWeight:800,color:'var(--amber)',fontSize:18,lineHeight:1}},'$'),
+    e('div',{style:{flex:1}},
+      e('b',null,until===0?'Pay day today':'Pay day tomorrow'),
+      ' - make sure every tally is entered and the app has synced before pay is run.'
+    ),
+    e('button',{onClick:dismiss,'aria-label':'Dismiss',style:{background:'transparent',color:'var(--muted)',border:0,fontSize:20,lineHeight:1,padding:'0 4px',cursor:'pointer'}},'\u00d7')
+  );
 }
 function InstallNudge(){
   const [gone,setGone]=useState(()=>!!lsGet(LS_A2HS_DISMISSED));
