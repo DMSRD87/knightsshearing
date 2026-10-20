@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73b';
+const APP_VERSION='v4.6.73c';
+/* v4.6.73c (20 Oct 2026): BIRELLAN FIX (Knights, 15 Oct: a PC with an old copy of the job saved over the shed phone all day; the shrink guard blocked the dangerous saves but mob TYPE flipped back to the job default and rousie runs blanked on screen). (1) Stale-device guard now covers mob type/desc - same seen-stamp rule as rate overrides (_srvMobMeta, guard_mobmeta_kept). (2) hydrateTallies overlays this device's own queued/in-flight cells over server rows so a refresh can never blank an unsent count. Server data was never wrong; nothing repriced. No pay-engine maths change. */
 /* v4.6.72d (15 Oct 2026): (1) TEAM CHAT - one channel per contractor on the home board (crew, lead, admin; never farmers): name: message, 30-day retention hard-deleted nightly by pg_cron (chat_messages table, Realtime on), live via Supabase Realtime while open + 60s poll, unread badge on the home-board bar, admin can delete, failed sends marked and retryable, no offline queue. Built because SMS broadcasts were being used as a group chat ($250 of the $534 all-time Twilio bill was one contractor). (2) SMS SMART-PUNCTUATION NORMALISER - curly quotes/long dashes flipped bodies to UCS-2 (half the characters per segment); every outgoing body now passes smsClean. (3) BROADCAST COST LINE - segments x recipients and an AUD estimate shown before Send, with a warning when emoji keep the body UCS-2. No pay, sync or settings change. */
 /* v4.6.73a (15 Oct 2026) = v4.6.73 (Xero push, Knights pilot) + the fleet 72b/72c additions: CREW + FARMER SMS TRIM to Dale's wording (both 2 GSM-7 segments; job detail stays behind the link) and PAY-DAY REMINDER on the home board for lead + admin the day before and on pay day (resolves like Pay Week; end-of-shed payers never see it; dismiss hides until the next pay date). UI + SMS text only - no pay, sync, DB or settings change. Xero push unchanged. */
 /* v4.6.72a (6 Oct 2026): nudge bar no longer hides the home-board buttons - while it shows, the fab-stack lifts clear of it (body.a2hs-on). Shed-name placeholder neutralised to 'e.g. Hilltop' (leak list - old value was a real station name). UI only - no pay, sync or data change. */
@@ -1136,6 +1137,25 @@ function dedupeRuns(job,where){
   return folded;
 }
 function hydrateTallies(job,tallyRows){
+  /* v4.6.72e — THIS DEVICE'S UNSENT CELLS STAY VISIBLE. A cell write that timed
+     out sits in LS_TALLY_QUEUE (or TALLY_INFLIGHT mid-flight) until the drain
+     lands it. Every refresh path rebuilt the job from SERVER rows only, so a
+     rousie's 4 runs or a shearer's count typed on bad signal vanished from the
+     screen the moment the app refreshed, then reappeared when the queue drained
+     (Birellan 15 Oct: all three shed hands' runs landed together at 4:47pm).
+     The server was never wrong; the screen was. Queued rows for this job are
+     overlaid on the server rows by cell key — the device's own newer value wins. */
+  try{
+    const mine=[];
+    (lsGet(LS_TALLY_QUEUE)||[]).forEach(function(r){if(r&&r.job_id===job.id)mine.push(r);});
+    if(typeof TALLY_INFLIGHT!=='undefined')TALLY_INFLIGHT.forEach(function(r){if(r&&r.job_id===job.id)mine.push(r);});
+    if(mine.length){
+      const byKey={};
+      (tallyRows||[]).forEach(function(r){byKey[tallyKey(r)]=r;});
+      mine.forEach(function(r){byKey[tallyKey(r)]=r;});
+      tallyRows=Object.values(byKey);
+    }
+  }catch(e){}
   /* Reset every count-bearing field. Mob structure stays. */
   if(job.runs){
     Object.values(job.runs).forEach(dayRuns=>{
@@ -1268,6 +1288,21 @@ function canonJSON(v){
     return JSON.stringify(k)+':'+canonJSON(v[k]);
   }).join(',')+'}';
 }
+/* v4.6.72e — mobId -> type|desc. Birellan 15 Oct: a PC holding an old copy of
+   the job saved its blob over the shed phone's, and every mob the shed had
+   retyped Shearing went back to the job default (Crutching). The rate-override
+   guard below proved the pattern; this is the same rule for type and desc. */
+function mobMetaMap(runs){
+  const m={};
+  Object.values(runs||{}).forEach(function(dayRuns){
+    (dayRuns||[]).forEach(function(run){
+      ((run&&run.mobs)||[]).forEach(function(mob){
+        if(mob&&mob.id)m[mob.id]=String(mob.type==null?'':mob.type)+''+String(mob.desc==null?'':mob.desc);
+      });
+    });
+  });
+  return m;
+}
 /* mobId -> rateOverride across every run/mob of a runs structure. */
 function mobRateMap(runs){
   const m={};
@@ -1292,7 +1327,7 @@ function stampFor(job){
   if(job._srvRates){
     try{rates=canonJSON(JSON.parse(job._srvRates));}catch(e){rates=null;}
   }
-  return {status:job._srvStatus,rates:rates,mobRates:job._srvMobRates||null,crew:job._srvCrew||null};
+  return {status:job._srvStatus,rates:rates,mobRates:job._srvMobRates||null,mobMeta:job._srvMobMeta||null,crew:job._srvCrew||null};
 }
 async function dbLoad(){
   try{
@@ -1352,6 +1387,7 @@ async function dbLoad(){
         _srvRates:JSON.stringify((r.data||{}).rates||{}),
         /* v4.6.69 — crew membership too. See guard_crew_kept. */
         _srvCrew:JSON.stringify(((r.data||{}).crew||[]).slice().sort()),
+        _srvMobMeta:mobMetaMap((r.data||{}).runs), /* v4.6.72e */
         _srvMobRates:(function(){
           /* v4.6.34 — mob rate overrides live inside runs, NOT in job.rates, so
              the rates guard never covered them. Three were lost this way, all of
@@ -1714,6 +1750,7 @@ function buildStrippedJobBlob(job){
   delete out._srvStatus; /* v4.6.30 — transient load-time markers, never persisted */
   delete out._srvRates;
   delete out._srvMobRates;
+  delete out._srvMobMeta; /* v4.6.72e */
   delete out._srvCrew; /* v4.6.69 */
   return out;
 }
@@ -2091,6 +2128,38 @@ async function dbSaveJob(job){
         }catch(mrErr){
           logSaveFailure('guard_mobrate_error',job.id,(mrErr&&mrErr.message)||'unknown');
         }
+        /* v4.6.72e — mob TYPE and DESC. If this device still carries the type/desc
+           it last saw from the server and the server now says something else,
+           someone else changed it and this device has no business reverting it.
+           A deliberate retype on this device differs from the stamp and is written
+           through. Mobs new on this device or never seen are left alone. */
+        try{
+          const mstamp=_stamp.mobMeta;
+          if(mstamp){
+            const srvMeta=mobMetaMap(srv.runs);
+            const srvMobs={};
+            Object.values((srv.runs)||{}).forEach(function(dayRuns){(dayRuns||[]).forEach(function(run){((run&&run.mobs)||[]).forEach(function(mob){if(mob&&mob.id)srvMobs[mob.id]=mob;});});});
+            const kept=[];
+            Object.values((jobForBlob.runs)||{}).forEach(function(dayRuns){
+              (dayRuns||[]).forEach(function(run){
+                ((run&&run.mobs)||[]).forEach(function(mob){
+                  if(!mob||!mob.id)return;
+                  if(!(mob.id in srvMeta)||!(mob.id in mstamp))return;
+                  /* type and desc judged separately: a device that only renamed a
+                     mob must not drag its stale type along with the rename. */
+                  const seen=String(mstamp[mob.id]).split(''),srvP=String(srvMeta[mob.id]).split('');
+                  const outT=String(mob.type==null?'':mob.type),outD=String(mob.desc==null?'':mob.desc);
+                  const sm=srvMobs[mob.id];
+                  if(outT===seen[0]&&srvP[0]!==outT){kept.push(mob.id+':type:'+outT+'->'+srvP[0]);mob.type=sm.type;}
+                  if(outD===(seen[1]||'')&&(srvP[1]||'')!==outD){kept.push(mob.id+':desc:'+outD+'->'+(srvP[1]||''));mob.desc=sm.desc;}
+                });
+              });
+            });
+            if(kept.length>0)logSaveFailure('guard_mobmeta_kept',job.id,kept.join(',').slice(0,480));
+          }
+        }catch(mmErr){
+          logSaveFailure('guard_mobmeta_error',job.id,(mmErr&&mmErr.message)||'unknown');
+        }
         const supabaseRunDates=Object.keys((srv.runs)||{}).length;
         if(supabaseRunDates>incomingRunDates){
           logSaveFailure(
@@ -2118,6 +2187,7 @@ async function dbSaveJob(job){
         status:jobForBlob.status,
         rates:canonJSON(jobForBlob.rates||{}),
         mobRates:mobRateMap(jobForBlob.runs),
+        mobMeta:mobMetaMap(jobForBlob.runs), /* v4.6.72e */
         crew:JSON.stringify((jobForBlob.crew||[]).slice().sort())
       });
     }catch(stampErr){
