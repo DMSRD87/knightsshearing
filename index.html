@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73c';
+const APP_VERSION='v4.6.73d';
+/* v4.6.73d (20 Oct 2026): PER-SHEARER OVERRIDES (Knights ask). Admin taps a shearer's name on any mob on the Tally tab: own $/head and Ganger on/off for THIS MOB or the WHOLE DAY. rates.shearerOverrides[crewId].byMob/byDate; most specific wins (shearer-mob > shearer-day > mob override > job rate); ganger true/false beats gangerByDate for that scope. ONE resolver (shearerBase/isGangerFor) feeds calcPeriodStats, generateSummary and payWeekJobData; grower mob totals untouched (base rates). Covered by the rates stale-device guard. Amber dot on the name when one applies. */
 /* v4.6.73c (20 Oct 2026): BIRELLAN FIX (Knights, 15 Oct: a PC with an old copy of the job saved over the shed phone all day; the shrink guard blocked the dangerous saves but mob TYPE flipped back to the job default and rousie runs blanked on screen). (1) Stale-device guard now covers mob type/desc - same seen-stamp rule as rate overrides (_srvMobMeta, guard_mobmeta_kept). (2) hydrateTallies overlays this device's own queued/in-flight cells over server rows so a refresh can never blank an unsent count. Server data was never wrong; nothing repriced. No pay-engine maths change. */
 /* v4.6.72d (15 Oct 2026): (1) TEAM CHAT - one channel per contractor on the home board (crew, lead, admin; never farmers): name: message, 30-day retention hard-deleted nightly by pg_cron (chat_messages table, Realtime on), live via Supabase Realtime while open + 60s poll, unread badge on the home-board bar, admin can delete, failed sends marked and retryable, no offline queue. Built because SMS broadcasts were being used as a group chat ($250 of the $534 all-time Twilio bill was one contractor). (2) SMS SMART-PUNCTUATION NORMALISER - curly quotes/long dashes flipped bodies to UCS-2 (half the characters per segment); every outgoing body now passes smsClean. (3) BROADCAST COST LINE - segments x recipients and an AUD estimate shown before Send, with a warning when emoji keep the body UCS-2. No pay, sync or settings change. */
 /* v4.6.73a (15 Oct 2026) = v4.6.73 (Xero push, Knights pilot) + the fleet 72b/72c additions: CREW + FARMER SMS TRIM to Dale's wording (both 2 GSM-7 segments; job detail stays behind the link) and PAY-DAY REMINDER on the home board for lead + admin the day before and on pay day (resolves like Pay Week; end-of-shed payers never see it; dismiss hides until the next pay date). UI + SMS text only - no pay, sync, DB or settings change. Xero push unchanged. */
@@ -2936,7 +2937,35 @@ function gangerOn(job,date){
   return job.leadId||null;
 }
 /* per-head premium added to this person's OWN head for one sheep of this type */
-function ownHeadLoading(job,rates,id,type,date){
+/* ── v4.6.72f PER-SHEARER OVERRIDES ──
+   Knights (20 Oct): "do each shearer individually, similar to mobs - if they gang
+   for one day or one mob". A learner on a lower rate for one mob, two blokes
+   splitting the ganger across a day, one shearer on a different deal for a day.
+   rates.shearerOverrides[crewId] = { byDate:{[date]:{rate,ganger}}, byMob:{[mobId]:{rate,ganger}} }
+   Resolution, most specific wins: this shearer on this mob > this shearer on
+   this day > mob-wide rateOverride > job per-head rate. ganger true/false on a
+   mob or day beats gangerByDate for that scope; null/absent = the day's ganger.
+   One resolver for all three pay outputs so they cannot diverge (v4.6.57 rule).
+   Lives inside job.rates, so the rates stale-device guard already covers it. */
+function shearerOv(rates,id,mobId,date){
+  const so=(((rates||{}).shearerOverrides||{})[id])||{};
+  const m=mobId?((so.byMob||{})[mobId]):null;
+  const d=date?((so.byDate||{})[date]):null;
+  const pick=k=>(m&&m[k]!=null&&m[k]!=='')?m[k]:((d&&d[k]!=null&&d[k]!=='')?d[k]:null);
+  return {rate:pick('rate'),ganger:pick('ganger')};
+}
+/* base $/head for THIS shearer on THIS mob. br = the mob's own base (override or job rate). */
+function shearerBase(rates,id,mob,date,br){
+  const ov=shearerOv(rates,id,mob&&mob.id,date);
+  return (ov.rate!=null&&Number(ov.rate)>0)?Number(ov.rate):br;
+}
+function isGangerFor(job,rates,id,date,mobId){
+  const ov=shearerOv(rates,id,mobId,date);
+  if(ov.ganger===true)return true;
+  if(ov.ganger===false)return false;
+  return gangerOn(job,date)===id;
+}
+function ownHeadLoading(job,rates,id,type,date,mobId){
   let add=0;
   const lt=((rates.loadingType||{})[id])||'individual';
   if(lt!=='team'){
@@ -2945,7 +2974,7 @@ function ownHeadLoading(job,rates,id,type,date){
     add+=(type==='Crutching')?((crRaw===undefined||crRaw===null||crRaw==='')?sh:(Number(crRaw)||0)):sh;
   }
   const gr=(rates.gangerRate||{})[type];
-  if(gr&&Number(gr)&&gangerOn(job,date)===id)add+=Number(gr)||0;
+  if(gr&&Number(gr)&&isGangerFor(job,rates,id,date,mobId))add+=Number(gr)||0; /* v4.6.72f */
   return add;
 }
 /* team-mode premium: base x every head the team did in the period */
@@ -2974,7 +3003,7 @@ function calcPeriodStats(job,period){
     }
     return days*((rates.travelRate||{})[id]||0);
   };
-  Object.entries(job.runs||{}).forEach(([date,rs])=>{if(!inP(date))return;rs.forEach(run=>{mobsOf(run).forEach(mob=>{const br=mob.rateOverride!=null?mob.rateOverride:(mob.type==='Shearing'?rates.shearingPerHead:rates.crutchingPerHead)||0;shIds.forEach(id=>{const cnt=mob.counts[id]||0;if(!cnt)return;shorn+=cnt;totalEarn+=cnt*(br+ownHeadLoading(job,rates,id,mob.type,date));});});});});
+  Object.entries(job.runs||{}).forEach(([date,rs])=>{if(!inP(date))return;rs.forEach(run=>{mobsOf(run).forEach(mob=>{const br=mob.rateOverride!=null?mob.rateOverride:(mob.type==='Shearing'?rates.shearingPerHead:rates.crutchingPerHead)||0;shIds.forEach(id=>{const cnt=mob.counts[id]||0;if(!cnt)return;shorn+=cnt;totalEarn+=cnt*(shearerBase(rates,id,mob,date,br)+ownHeadLoading(job,rates,id,mob.type,date,mob.id));});});});});
   /* v4.6.57 — team loading was missing here entirely */
   shIds.forEach(id=>{totalEarn+=teamLoadingEarn(job,rates,id,shIds,inP);});
   // Shed staff
@@ -3197,7 +3226,7 @@ function generateSummary(job,period){
   const dash='\u2500'.repeat(52);
   const inP=date=>!period||(date>=period.start&&date<=period.end);
   const shornBy={};shIds.forEach(id=>{shornBy[id]={sh:0,shEarn:0,cr:0,crEarn:0,mobs:[],daysSet:{}};});
-  Object.entries(job.runs||{}).forEach(([date,dayRuns])=>{if(!inP(date))return;dayRuns.forEach(run=>{mobsOf(run).forEach(mob=>{const hasOverride=mob.rateOverride!=null;const br=hasOverride?mob.rateOverride:(mob.type==='Shearing'?rates.shearingPerHead:rates.crutchingPerHead)||0;shIds.forEach(id=>{const cnt=mob.counts[id]||0;if(!cnt)return;shornBy[id].daysSet[date]=1;const effRate=br+ownHeadLoading(job,rates,id,mob.type,date);const earn=cnt*effRate;if(mob.type==='Shearing'){shornBy[id].sh+=cnt;shornBy[id].shEarn+=earn;}else{shornBy[id].cr+=cnt;shornBy[id].crEarn+=earn;}/* merge into same mob bucket if same type/desc/rate */const key=mob.type+'|'+(mob.desc||'')+'|'+effRate.toFixed(4)+'|'+(hasOverride?'O':'B');let bucket=shornBy[id].mobs.find(m=>m.key===key);if(!bucket){bucket={key,type:mob.type,desc:mob.desc||'',rate:effRate,hasOverride,count:0,earn:0};shornBy[id].mobs.push(bucket);}bucket.count+=cnt;bucket.earn+=earn;});});});});
+  Object.entries(job.runs||{}).forEach(([date,dayRuns])=>{if(!inP(date))return;dayRuns.forEach(run=>{mobsOf(run).forEach(mob=>{const hasOverride=mob.rateOverride!=null;const br=hasOverride?mob.rateOverride:(mob.type==='Shearing'?rates.shearingPerHead:rates.crutchingPerHead)||0;shIds.forEach(id=>{const cnt=mob.counts[id]||0;if(!cnt)return;shornBy[id].daysSet[date]=1;const brI=shearerBase(rates,id,mob,date,br);const hasOvI=hasOverride||brI!==br;const effRate=brI+ownHeadLoading(job,rates,id,mob.type,date,mob.id);const earn=cnt*effRate;if(mob.type==='Shearing'){shornBy[id].sh+=cnt;shornBy[id].shEarn+=earn;}else{shornBy[id].cr+=cnt;shornBy[id].crEarn+=earn;}/* merge into same mob bucket if same type/desc/rate */const key=mob.type+'|'+(mob.desc||'')+'|'+effRate.toFixed(4)+'|'+(hasOvI?'O':'B');let bucket=shornBy[id].mobs.find(m=>m.key===key);if(!bucket){bucket={key,type:mob.type,desc:mob.desc||'',rate:effRate,hasOverride:hasOvI,count:0,earn:0};shornBy[id].mobs.push(bucket);}bucket.count+=cnt;bucket.earn+=earn;});});});});
   const tr=rates.travelRate||{};
   const travelDayCount=id=>Object.entries((job.travelTallies||{})[id]||{}).filter(([d,v])=>v&&inP(d)).length;
   /* v4.6.3c: mode-aware travel helpers. travelMode='km' uses driverKm × travelKmRate; otherwise $/day. */
@@ -3636,7 +3665,7 @@ function payWeekJobData(job,period){
     const br=hasO?mob.rateOverride:(mob.type==='Shearing'?rates.shearingPerHead:rates.crutchingPerHead)||0;
     shIds.forEach(id=>{const cnt=(mob.counts||{})[id]||0;if(!cnt)return;
       (daysSet[id]=daysSet[id]||{})[date]=1;
-      const eff=br+ownHeadLoading(job,rates,id,mob.type,date);
+      const eff=shearerBase(rates,id,mob,date,br)+ownHeadLoading(job,rates,id,mob.type,date,mob.id);
       const k=id+'|'+date+'|'+mob.type+'|'+eff.toFixed(4);
       if(!agg[k])agg[k]={id,date,type:mob.type,rate:eff,cnt:0};
       agg[k].cnt+=cnt;});
@@ -5068,6 +5097,55 @@ function BookPhotoPanel({job,viewDate,role}){
 /* ════════════════════════
    TALLY TAB
 ════════════════════════ */
+/* v4.6.72f — the sheet behind a tapped shearer name on the Tally tab. Two scopes:
+   this mob, and the whole day. Rate blank = inherit; ganger Default/On/Off. */
+function ShearerOverrideSheet({job,setJob,role,id,mobId,date,onClose}){
+  const rates=job.rates||{};
+  const c=gc(id)||{name:'?'};
+  let mob=null;(((job.runs||{})[date])||[]).forEach(run=>mobsOf(run).forEach(m=>{if(m.id===mobId)mob=m;}));
+  const mobBase=mob?(mob.rateOverride!=null?mob.rateOverride:(mob.type==='Shearing'?rates.shearingPerHead:rates.crutchingPerHead)||0):0;
+  const so=((rates.shearerOverrides||{})[id])||{};
+  const cur=scope=>scope==='mob'?(((so.byMob||{})[mobId])||{}):(((so.byDate||{})[date])||{});
+  const write=(scope,patch)=>{
+    setJob(prev=>{
+      const r=prev.rates||{};const all={...(r.shearerOverrides||{})};const mine={byDate:{...((all[id]||{}).byDate||{})},byMob:{...((all[id]||{}).byMob||{})}};
+      const key=scope==='mob'?mobId:date;const bucket=scope==='mob'?mine.byMob:mine.byDate;
+      const next={...(bucket[key]||{}),...patch};
+      Object.keys(next).forEach(k=>{if(next[k]==null||next[k]==='')delete next[k];});
+      if(Object.keys(next).length)bucket[key]=next;else delete bucket[key];
+      if(!Object.keys(mine.byDate).length&&!Object.keys(mine.byMob).length)delete all[id];else all[id]=mine;
+      return {...prev,rates:{...r,shearerOverrides:all}};
+    });
+    logJobEvent(job.id,'shearer_override',(c.name||id)+' '+(scope==='mob'?('mob '+((mob&&mob.desc)||mobId)):date)+': '+JSON.stringify(patch),role);
+  };
+  const seg=(scope,val)=>e('div',{style:{display:'flex',gap:6}},[['Default',null],['Ganger on',true],['Ganger off',false]].map(([lbl,v])=>
+    e('button',{key:lbl,onClick:()=>write(scope,{ganger:v}),style:{flex:1,padding:'8px 4px',borderRadius:8,fontSize:12,fontWeight:700,cursor:'pointer',
+      border:'1px solid '+(val===v?'var(--amber)':'var(--border)'),background:val===v?'var(--amberD)':'var(--card2)',color:'var(--text)'}},lbl)));
+  const block=(scope,title,sub)=>{const v=cur(scope);const g=v.ganger==null?null:v.ganger;
+    return e('div',{style:{margin:'0 16px 12px',padding:'12px',background:'var(--card2)',border:'1px solid var(--border)',borderRadius:10}},
+      e('div',{style:{fontWeight:800,fontSize:14}},title),
+      e('div',{style:{fontSize:12,color:'var(--muted)',marginBottom:8}},sub),
+      e('div',{className:'rate-override-row'},
+        e('span',{className:'ro-lbl'},'Own rate $/head:'),
+        e('input',{type:'number',step:'0.05',min:'0',inputMode:'decimal',className:'ro-inp',placeholder:String(mobBase||''),value:v.rate!=null?v.rate:'',
+          onWheel:ev=>ev.currentTarget.blur(),onChange:ev=>write(scope,{rate:ev.target.value===''?null:(parseFloat(ev.target.value)||null)})}),
+        e('span',{className:'ro-eff'},v.rate!=null?'overrides $'+Number(mobBase).toFixed(2):'inherits')),
+      seg(scope,g));
+  };
+  const gr=rates.gangerRate||{};const gset=!!(Number(gr.Shearing)||Number(gr.Crutching));
+  return e('div',{className:'overlay overlay2',onClick:ev=>{if(ev.target===ev.currentTarget)onClose();}},e('div',{className:'sheet'},
+    e('div',{className:'sheet-handle'}),
+    e('div',{className:'sheet-title'},c.name,e('div',{style:{fontSize:12,fontWeight:400,color:'var(--muted)',fontFamily:'var(--b)'}},fmtDateLong(date)+(mob?' · '+(mob.desc||mob.type):''))),
+    e('div',{className:'sheet-scroll',style:{paddingTop:12}},
+      mob&&block('mob','This mob only',(mob.desc||mob.type)+' · mob base $'+Number(mobBase).toFixed(2)+'/head'),
+      block('day','Whole day','Every mob '+c.name.split(' ')[0]+' shears on '+fmtDateLong(date)),
+      e('div',{style:{margin:'0 16px 12px',fontSize:12,color:'var(--muted)',lineHeight:1.5}},
+        'Most specific wins: this mob, then this day, then the mob-wide override, then the job rate. ',
+        gset?'Ganger adds $'+(Number(gr.Shearing)||Number(gr.Crutching)).toFixed(2)+'/head to their own tally.':'No ganger rate set on this job - set one in Rates for Ganger on/off to pay anything.'),
+      e('div',{style:{padding:'0 16px 16px'}},e('button',{onClick:onClose,style:{width:'100%',padding:12,borderRadius:10,border:0,background:'var(--amber)',color:'#1e2a3a',fontWeight:800,fontSize:15,cursor:'pointer'}},'Done'))
+    )
+  ));
+}
 function TallyTab({job,setJob,role,viewDate,setViewDate}){
   const canEdit=role==='shed_lead'||role==='admin';
   const isAdmin=role==='admin';
@@ -5082,6 +5160,7 @@ function TallyTab({job,setJob,role,viewDate,setViewDate}){
   const orderedShearers=[...orderedFromSaved,...unorderedNew];
   const [reorderMode,setReorderMode]=useState(false);
   const [confirmDelRun,setConfirmDelRun]=useState(null); /* run id awaiting delete confirmation */
+  const [shOv,setShOv]=useState(null); /* v4.6.72f - {id,mobId} shearer override sheet */
   const shedStaff=job.crew.filter(id=>{const r=getJobRole(job,id);return r==='Wool Handler'||r==='Wool Classer'||r==='Penner';});
   const pressers=job.crew.filter(id=>(getJobRole(job,id)||gc(id)?.role)==='Presser');
   const rates=job.rates||{};
@@ -5402,6 +5481,7 @@ const flushMobDesc=(mid,v)=>{
   const roleGroups=[{lbl:'WOOL HANDLER',ids:shedStaff.filter(id=>(getJobRole(job,id)||gc(id)?.role)==='Wool Handler')},{lbl:'CLASSER',ids:shedStaff.filter(id=>(getJobRole(job,id)||gc(id)?.role)==='Wool Classer')},{lbl:'PENNER',ids:shedStaff.filter(id=>(getJobRole(job,id)||gc(id)?.role)==='Penner')}].filter(g=>g.ids.length>0);
 
   return e('div',null,
+    shOv&&e(ShearerOverrideSheet,{job,setJob,role,id:shOv.id,mobId:shOv.mobId,date:viewDate,onClose:()=>setShOv(null)}), /* v4.6.72f */
     /* v4.6.61 — the mob names already used on this job, newest first. Built from
        the job's own runs so it needs no extra query and is always current. */
     (function(){
@@ -5528,9 +5608,13 @@ const flushMobDesc=(mid,v)=>{
                     e('button',{onClick:()=>moveShearer(idx,-1),disabled:idx===0,style:{width:24,height:24,borderRadius:5,border:'1px solid var(--border)',background:idx===0?'var(--card2)':'var(--amberD)',color:idx===0?'var(--dim)':'var(--amber)',fontWeight:800,cursor:idx===0?'default':'pointer',fontSize:14,lineHeight:1}},'◀'),
                     e('button',{onClick:()=>moveShearer(idx,1),disabled:idx===orderedShearers.length-1,style:{width:24,height:24,borderRadius:5,border:'1px solid var(--border)',background:idx===orderedShearers.length-1?'var(--card2)':'var(--amberD)',color:idx===orderedShearers.length-1?'var(--dim)':'var(--amber)',fontWeight:800,cursor:idx===orderedShearers.length-1?'default':'pointer',fontSize:14,lineHeight:1}},'▶')
                   ),
-                  e('div',{className:'sh-col-name'},
+                  e('div',{className:'sh-col-name',
+                    /* v4.6.72f - admin taps the name to set this shearer's own rate / ganger for this mob or day */
+                    onClick:(isAdmin&&!reorderMode)?()=>setShOv({id,mobId:mob.id}):undefined,
+                    style:(isAdmin&&!reorderMode)?{cursor:'pointer',textDecoration:'underline dotted',textUnderlineOffset:2}:undefined},
                     reorderMode&&e('span',{style:{fontFamily:'var(--m)',fontSize:9,fontWeight:800,color:'var(--amber)',marginRight:3}},(idx+1)+'.'),
-                    sn(c.name)
+                    sn(c.name),
+                    (function(){const o=shearerOv(rates,id,mob.id,viewDate);return (o.rate!=null||o.ganger!=null)?e('span',{title:'own rate / ganger set',style:{color:'var(--amber)',marginLeft:2}},'\u25CF'):null;})()
                   ),
                   e('input',{type:'text',inputMode:'numeric',pattern:'[0-9]*',className:'sh-col-inp',placeholder:'—',value:mob.counts[id]||'',disabled:!canEdit||reorderMode,inputMode:'numeric',onChange:ev=>setMobCnt(run.id,mob.id,id,ev.target.value),onFocus:ev=>ev.target.select()})
                 );}),
