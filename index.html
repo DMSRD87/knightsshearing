@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73d';
+const APP_VERSION='v4.6.73e';
+/* v4.6.73e (21 Oct 2026): A QUEUE FLUSH CAN NEVER DROP A ROW (Baxters 20 Oct, DB-proven: three tally flushes overlapped on a signal blip at 2:32:04pm and a run's counts queued mid-flush were overwritten by a flush writing its stale leftovers back over the whole queue; same pattern in the job-blob and mob-metadata queues, which is also the likely cause of Hancock Redpath 17 Oct where 4 runs/411 head are in tally_entries but not the job). (1) JOURNAL FIRST - writeTallyCell puts the row in localStorage before any network call. (2) REMOVE BY IDENTITY - every flush removes only the exact row it landed (key + timestamp) from the live queue; never writes a list back. (3) SINGLE FLIGHT - one flush per queue at a time, late callers trigger one more pass. (4) NEWEST KEYSTROKE WINS - a new write for a cell aborts the older airborne one, and the DB trigger tally_entries_no_stale_overwrite refuses an older updated_at over a newer one (10-minute window, so a wrong phone clock cannot lock a device out). No pay, sync-order or settings change. */
 /* v4.6.73d (20 Oct 2026): PER-SHEARER OVERRIDES (Knights ask). Admin taps a shearer's name on any mob on the Tally tab: own $/head and Ganger on/off for THIS MOB or the WHOLE DAY. rates.shearerOverrides[crewId].byMob/byDate; most specific wins (shearer-mob > shearer-day > mob override > job rate); ganger true/false beats gangerByDate for that scope. ONE resolver (shearerBase/isGangerFor) feeds calcPeriodStats, generateSummary and payWeekJobData; grower mob totals untouched (base rates). Covered by the rates stale-device guard. Amber dot on the name when one applies. */
 /* v4.6.73c (20 Oct 2026): BIRELLAN FIX (Knights, 15 Oct: a PC with an old copy of the job saved over the shed phone all day; the shrink guard blocked the dangerous saves but mob TYPE flipped back to the job default and rousie runs blanked on screen). (1) Stale-device guard now covers mob type/desc - same seen-stamp rule as rate overrides (_srvMobMeta, guard_mobmeta_kept). (2) hydrateTallies overlays this device's own queued/in-flight cells over server rows so a refresh can never blank an unsent count. Server data was never wrong; nothing repriced. No pay-engine maths change. */
 /* v4.6.72d (15 Oct 2026): (1) TEAM CHAT - one channel per contractor on the home board (crew, lead, admin; never farmers): name: message, 30-day retention hard-deleted nightly by pg_cron (chat_messages table, Realtime on), live via Supabase Realtime while open + 60s poll, unread badge on the home-board bar, admin can delete, failed sends marked and retryable, no offline queue. Built because SMS broadcasts were being used as a group chat ($250 of the $534 all-time Twilio bill was one contractor). (2) SMS SMART-PUNCTUATION NORMALISER - curly quotes/long dashes flipped bodies to UCS-2 (half the characters per segment); every outgoing body now passes smsClean. (3) BROADCAST COST LINE - segments x recipients and an AUD estimate shown before Send, with a warning when emoji keep the body UCS-2. No pay, sync or settings change. */
@@ -744,6 +745,29 @@ const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||'null');}catch{re
 const lsSet=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch(e){console.warn('localStorage full',e);}};
 const lsRemove=k=>{try{localStorage.removeItem(k);}catch(e){}};
 
+/* ── v4.6.72g QUEUE DISCIPLINE ──
+   Every flush used to read its queue into memory, spend up to 12s per row on the
+   network, then write its leftovers back over the whole queue. Anything queued
+   during those seconds vanished. Baxters 20 Oct: three tally flushes overlapped
+   on a signal blip and a run's counts queued mid-flush were overwritten
+   (DB-proven from the failure log, 2:32:04pm). Rules now:
+   - singleFlight: one flush per queue at a time; a caller that arrives during a
+     flush flags it to run once more at the end, so late rows are still drained.
+   - removeQueued: a flush removes ONLY the exact row it landed, from the LIVE
+     queue, by identity. It never writes a stale list back. A newer value for the
+     same cell queued meanwhile survives and goes next round. */
+const _flushLocks={};
+async function singleFlight(key,fn){
+  if(_flushLocks[key]){_flushLocks[key].again=true;return _flushLocks[key].p;}
+  const st={again:false};
+  st.p=(async()=>{let total=0,guard=0;do{st.again=false;total+=(await fn())||0;}while(st.again&&++guard<5);return total;})()
+    .finally(()=>{delete _flushLocks[key];});
+  _flushLocks[key]=st;
+  return st.p;
+}
+function removeQueued(lsKey,pred){
+  try{const q=lsGet(lsKey)||[];const left=q.filter(x=>!pred(x));if(left.length!==q.length)lsSet(lsKey,left);}catch(e){}
+}
 function queueWrite(type,id,data){
   const q=lsGet(LS_QUEUE)||[];
   const filtered=q.filter(x=>!(x.type===type&&x.id===id));
@@ -754,7 +778,8 @@ function dequeue(type,id){
   const q=lsGet(LS_QUEUE)||[];
   lsSet(LS_QUEUE,q.filter(x=>!(x.type===type&&x.id===id)));
 }
-async function flushQueue(){
+async function flushQueue(){return singleFlight('job',_flushQueueOnce);}
+async function _flushQueueOnce(){
   const q=lsGet(LS_QUEUE)||[];
   if(!q.length)return 0;
   let flushed=0;
@@ -783,13 +808,13 @@ async function flushQueue(){
         failed.push(item);
         logSaveFailure('error',item.type+':'+item.id,res.error.message);
       }
-      else{flushed++;}
+      else{flushed++;removeQueued(LS_QUEUE,x=>x.type===item.type&&x.id===item.id&&x.ts===item.ts);}
     }catch(e){
       failed.push(item);
       logSaveFailure(e.message==='flush_timeout'?'timeout':'error',item.type+':'+item.id,e.message);
     }
   }
-  lsSet(LS_QUEUE,failed);
+  /* v4.6.72g - the live queue is never overwritten; failed rows are still in it */
   return flushed;
 }
 
@@ -839,6 +864,7 @@ function queueTallyCell(row){
    dispatched row until its upsert settles; flushInflightTallies dumps
    unsettled rows into LS_TALLY_QUEUE synchronously on page hide. */
 const TALLY_INFLIGHT=new Map();
+const TALLY_CTRL=new Map(); /* v4.6.72g - cell key -> AbortController of the airborne write */
 
 function flushInflightTallies(){
   if(TALLY_INFLIGHT.size===0)return;
@@ -848,7 +874,7 @@ function flushInflightTallies(){
      20s background drain / goOnline flush pushes these on resume. queueTallyCell
      dedups per cell key so a row that also lands via keepalive or a resumed
      fetch just re-upserts the same value — harmless. */
-  rows.forEach(queueTallyCell);
+  rows.forEach(r=>{const q=lsGet(LS_TALLY_QUEUE)||[];if(!q.some(x=>tallyKey(x)===tallyKey(r)))queueTallyCell(r);}); /* v4.6.72g - never over a newer queued value */
   /* Best-effort push while the page can still speak: fetch keepalive is
      allowed to complete after the page hides on modern WebKit/Blink. NOT
      guaranteed — the queue above is the actual safety net. */
@@ -892,28 +918,39 @@ async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value,mobType,
     if(mobType!=null)row.mob_type=mobType;
     if(mobDesc!=null)row.mob_desc=mobDesc;
   }
-  if(!navigator.onLine){
-    queueTallyCell(row);
-    return;
-  }
+  /* v4.6.72g - JOURNAL FIRST. The typed value is in localStorage before any
+     network call is attempted, so no timeout, abort, reload or overlapping
+     flush can lose it. Success removes exactly this row; failure leaves it for
+     the drain. queueTallyCell replaces an older queued value for the same cell,
+     so the newest keystroke is always the one that lands. */
+  queueTallyCell(row);
+  if(!navigator.onLine)return;
   /* v4.6.11e — register as in-flight until the upsert settles. If the page
      hides while this write is airborne, flushInflightTallies queues it. */
   const _ik=tallyKey(row);
   TALLY_INFLIGHT.set(_ik,row);
+  /* v4.6.72g - a newer keystroke for the same cell cancels the older airborne request,
+     so a slow stale request can no longer land AFTER the correction and win. The DB
+     trigger tally_entries_no_stale_overwrite is the second layer for other devices. */
+  const _prev=TALLY_CTRL.get(_ik);if(_prev){try{_prev.abort();}catch(e){}}
+  const _ctrl=(typeof AbortController!=='undefined')?new AbortController():null;
+  if(_ctrl)TALLY_CTRL.set(_ik,_ctrl);
   try{
-    const result=await withTimeout(
-      sb.from('tally_entries').upsert(row,{
+    let _q=sb.from('tally_entries').upsert(row,{
         onConflict:'contractor_slug,job_id,cell_date,kind,run_id,mob_id,crew_id'
-      }),
-      5000,
-      'tally_upsert_timeout'
-    );
+      });
+    if(_ctrl&&typeof _q.abortSignal==='function')_q=_q.abortSignal(_ctrl.signal);
+    const result=await withTimeout(_q,5000,'tally_upsert_timeout',_ctrl);
     if(result&&result.error)throw new Error(result.error.message);
     /* Only clear if a newer write for the same cell hasn't replaced our entry */
     if(TALLY_INFLIGHT.get(_ik)===row)TALLY_INFLIGHT.delete(_ik);
+    if(TALLY_CTRL.get(_ik)===_ctrl)TALLY_CTRL.delete(_ik);
+    removeQueued(LS_TALLY_QUEUE,x=>tallyKey(x)===_ik&&x.updated_at===row.updated_at); /* v4.6.72g - landed */
   }catch(e){
     if(TALLY_INFLIGHT.get(_ik)===row)TALLY_INFLIGHT.delete(_ik);
-    queueTallyCell(row);
+    if(TALLY_CTRL.get(_ik)===_ctrl)TALLY_CTRL.delete(_ik);
+    if(e&&(e.name==='AbortError'||/abort/i.test(e.message||'')))return; /* v4.6.72g - superseded by a newer keystroke, nothing to log */
+    /* v4.6.72g - already journaled; re-queueing here could clobber a newer value for the same cell */
     logSaveFailure(
       e.message==='tally_upsert_timeout'?'timeout':'error',
       'tally:'+jobId+':'+kind+':'+crewId,
@@ -922,7 +959,8 @@ async function writeTallyCell({jobId,kind,runId,mobId,crewId,date,value,mobType,
   }
 }
 
-async function flushTallyQueue(){
+async function flushTallyQueue(){return singleFlight('tally',_flushTallyQueueOnce);}
+async function _flushTallyQueueOnce(){
   const q=lsGet(LS_TALLY_QUEUE)||[];
   if(!q.length)return 0;
   let flushed=0;
@@ -953,6 +991,7 @@ async function flushTallyQueue(){
           const tries=row._dead_tries||0;
           const cleanRow={...row};delete cleanRow._dead_tries;
           const dead=lsGet(LS_TALLY_DEAD)||[];dead.push({row:cleanRow,err:msg,at:new Date().toISOString(),tries});lsSet(LS_TALLY_DEAD,dead);
+          removeQueued(LS_TALLY_QUEUE,x=>tallyKey(x)===tallyKey(row)&&x.updated_at===row.updated_at); /* v4.6.72g */
           logSaveFailure('error','tally_flush_quarantined:'+row.job_id+':'+row.kind,msg);
         }else{
           const cleanRow={...row};delete cleanRow._dead_tries;
@@ -961,6 +1000,7 @@ async function flushTallyQueue(){
         }
       }else{
         flushed++;
+        removeQueued(LS_TALLY_QUEUE,x=>tallyKey(x)===tallyKey(row)&&x.updated_at===row.updated_at); /* v4.6.72g - this row only */
       }
     }catch(e){
       failed.push(row);
@@ -971,7 +1011,7 @@ async function flushTallyQueue(){
       );
     }
   }
-  lsSet(LS_TALLY_QUEUE,failed);
+  /* v4.6.72g - the live queue is never overwritten; failed rows are still in it */
   return flushed;
 }
 
@@ -980,13 +1020,14 @@ async function flushTallyQueue(){
    bulk UPDATEs keyed on mob_id, not per-cell upserts. Idempotent: re-applying
    the same patch is harmless. Failures re-queue (transient) and are retried by
    the same paths that call flushTallyQueue. Capped to avoid unbounded growth. */
-async function flushTallyMetaQueue(){
+async function flushTallyMetaQueue(){return singleFlight('meta',_flushTallyMetaQueueOnce);}
+async function _flushTallyMetaQueueOnce(){
   const q=lsGet(LS_TALLY_META_QUEUE)||[];
   if(!q.length)return 0;
   let flushed=0;
   const failed=[];
   for(const item of q){
-    if(!item||!item.mob_id||!item.patch){flushed++;continue;}
+    if(!item||!item.mob_id||!item.patch){flushed++;removeQueued(LS_TALLY_META_QUEUE,x=>x===item||JSON.stringify(x)===JSON.stringify(item));continue;}
     try{
       const r=await withTimeout(
         sb.from('tally_entries').update(item.patch)
@@ -1000,18 +1041,18 @@ async function flushTallyMetaQueue(){
            on the next type/desc edit. Log so it's visible SRD-side. */
         if(/column .* does not exist|invalid input/i.test(msg)){
           logSaveFailure('error','meta_flush_dropped:'+item.job_id+':'+item.mob_id,msg);
-          flushed++;
+          flushed++;removeQueued(LS_TALLY_META_QUEUE,x=>x.job_id===item.job_id&&x.mob_id===item.mob_id&&x.at===item.at);
         }else{
           failed.push(item);
           logSaveFailure('error','meta_flush:'+item.job_id+':'+item.mob_id,msg);
         }
-      }else{flushed++;}
+      }else{flushed++;removeQueued(LS_TALLY_META_QUEUE,x=>x.job_id===item.job_id&&x.mob_id===item.mob_id&&x.at===item.at);}
     }catch(e){
       failed.push(item);
       logSaveFailure(e.message==='meta_flush_timeout'?'timeout':'error','meta_flush:'+item.job_id+':'+item.mob_id,e.message);
     }
   }
-  lsSet(LS_TALLY_META_QUEUE,failed.slice(-500));
+  /* v4.6.72g - the live queue is never overwritten */
   return flushed;
 }
 
