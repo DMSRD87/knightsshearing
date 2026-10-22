@@ -29,7 +29,7 @@
    Cost, stated plainly: a slow-but-live link may serve the previous build once.
    No cache means no fallback, so a first-ever install still needs signal — that
    has always been true. CACHE bumped so every device reactivates. */
-const CACHE = 'mygang-v10';
+const CACHE = 'mygang-v11'; /* v11: bumped so every device drops the cached Xero catalog */
 const PRECACHE = [
   '/',
   /* pinned — what current builds request */
@@ -76,6 +76,15 @@ self.addEventListener('fetch', event => {
 
   /* Supabase API calls — DO NOT INTERCEPT. */
   if (url.includes('supabase.co')) {
+    return;
+  }
+  /* v11 (22 Oct 2026) — Xero broker and any /api/ call — DO NOT INTERCEPT.
+     The cache-first rule at the bottom was caching GET /api/xero/catalog and
+     /api/xero/mappings the first time the Xero screen opened, so a bookkeeper's
+     laptop kept showing the Xero employee list as it was that day: new starters
+     added in Xero never appeared and the push stayed blocked. Live data is never
+     served from cache. */
+  if (url.includes('mygangxero') || url.includes('/api/')) {
     return;
   }
 
