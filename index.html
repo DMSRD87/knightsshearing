@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73e';
+const APP_VERSION='v4.6.73f';
+/* v4.6.73f (25 Oct 2026): ONE WRITE ROUTINE FOR jobs.data (Knights 25 Oct, DB-proven: MCIN-0030 lost 7 crew, its start date and sheep count to a 5-day-old blob flushed RAW from the job queue - the flush path ran no guard and wrote no snapshot; PYLA-0035 lost 9 crew the same way, CLEA-0095 was un-charged-out three times; every refused shrink save since May was queued and later flushed raw). mergeAndWriteJob is now the only write path for direct saves, queue flushes and sync-on-open. (1) A device can only change what it changed: per field at every level - top-level fields, status, rates, each crew-details/override entry, each day/run/mob - the server's value is kept wherever this device still holds what it last saw and the server has moved on; a deliberate edit is written through. (2) Guards are mandatory: reads get 8s with one retry and if they cannot complete nothing is written - the blob is queued WITH its stamp and merged later. (3) Nothing is refused-then-queued; work is protected as a merge rule (a run with cells or a person with work is never dropped). (4) Writes are conditional on updated_at with re-merge on conflict. (5) A merge that changes nothing writes nothing. (6) Blobs queued by the previous build (no stamp) can only add, never remove or revert. Log reasons: merge_kept, merge_noop_kept, merge_unavailable_queued, merge_conflict_retry, guard_shrink_restored, guard_crew_restored, queue_item_expired. No pay, tally-cell, UI, SMS or Xero change. */
 /* v4.6.73e (21 Oct 2026): A QUEUE FLUSH CAN NEVER DROP A ROW (Baxters 20 Oct, DB-proven: three tally flushes overlapped on a signal blip at 2:32:04pm and a run's counts queued mid-flush were overwritten by a flush writing its stale leftovers back over the whole queue; same pattern in the job-blob and mob-metadata queues, which is also the likely cause of Hancock Redpath 17 Oct where 4 runs/411 head are in tally_entries but not the job). (1) JOURNAL FIRST - writeTallyCell puts the row in localStorage before any network call. (2) REMOVE BY IDENTITY - every flush removes only the exact row it landed (key + timestamp) from the live queue; never writes a list back. (3) SINGLE FLIGHT - one flush per queue at a time, late callers trigger one more pass. (4) NEWEST KEYSTROKE WINS - a new write for a cell aborts the older airborne one, and the DB trigger tally_entries_no_stale_overwrite refuses an older updated_at over a newer one (10-minute window, so a wrong phone clock cannot lock a device out). No pay, sync-order or settings change. */
 /* v4.6.73d (20 Oct 2026): PER-SHEARER OVERRIDES (Knights ask). Admin taps a shearer's name on any mob on the Tally tab: own $/head and Ganger on/off for THIS MOB or the WHOLE DAY. rates.shearerOverrides[crewId].byMob/byDate; most specific wins (shearer-mob > shearer-day > mob override > job rate); ganger true/false beats gangerByDate for that scope. ONE resolver (shearerBase/isGangerFor) feeds calcPeriodStats, generateSummary and payWeekJobData; grower mob totals untouched (base rates). Covered by the rates stale-device guard. Amber dot on the name when one applies. */
 /* v4.6.73c (20 Oct 2026): BIRELLAN FIX (Knights, 15 Oct: a PC with an old copy of the job saved over the shed phone all day; the shrink guard blocked the dangerous saves but mob TYPE flipped back to the job default and rousie runs blanked on screen). (1) Stale-device guard now covers mob type/desc - same seen-stamp rule as rate overrides (_srvMobMeta, guard_mobmeta_kept). (2) hydrateTallies overlays this device's own queued/in-flight cells over server rows so a refresh can never blank an unsent count. Server data was never wrong; nothing repriced. No pay-engine maths change. */
@@ -768,10 +769,12 @@ async function singleFlight(key,fn){
 function removeQueued(lsKey,pred){
   try{const q=lsGet(lsKey)||[];const left=q.filter(x=>!pred(x));if(left.length!==q.length)lsSet(lsKey,left);}catch(e){}
 }
-function queueWrite(type,id,data){
+function queueWrite(type,id,data,stamp){
   const q=lsGet(LS_QUEUE)||[];
   const filtered=q.filter(x=>!(x.type===type&&x.id===id));
-  filtered.push({type,id,data,ts:Date.now()});
+  const item={type,id,data,ts:Date.now()};
+  if(stamp)item.stamp=stamp; /* v4.6.72h - what this device last saw; the flush merges against it */
+  filtered.push(item);
   lsSet(LS_QUEUE,filtered);
 }
 function dequeue(type,id){
@@ -788,15 +791,24 @@ async function _flushQueueOnce(){
     try{
       let call;
       if(item.type==='job'){
-        /* v4.6.3 FIX: strip tally fields here too. Previous versions wrote
-           item.data raw, which meant any job that ever entered the queue
-           (offline saves, goOnline preserveDirty path, dbSaveJob catch
-           fallback) bypassed the tally strip and could carry stale tally
-           counts back into jobs.data on flush. */
+        /* v4.6.72h - R1/R5. A queued job used to be upserted RAW here: no guard,
+           no snapshot, whatever the server had learned since. Knights MCIN-0030,
+           25 Oct: a blob queued Friday 2:38pm landed Sunday 4:23pm over 7 crew
+           and a date change. It now merges exactly like a direct save, against
+           the stamp it was queued with. A blob older than a fortnight has
+           nothing left to say and is dropped with a log line. */
         const strippedData=(typeof buildStrippedJobBlob==='function')
           ?buildStrippedJobBlob(item.data)
           :item.data;
-        call=sb.from('jobs').upsert({id:item.id,contractor_slug:CONTRACTOR_SLUG,data:strippedData,updated_at:new Date().toISOString()},{onConflict:'id'});
+        if(item.ts&&(Date.now()-item.ts)>14*86400000){
+          logSaveFailure('queue_item_expired',item.id,'age_days='+Math.round((Date.now()-item.ts)/86400000));
+          removeQueued(LS_QUEUE,x=>x.type===item.type&&x.id===item.id&&x.ts===item.ts);flushed++;continue;
+        }
+        const mres=await mergeAndWriteJob(item.id,strippedData,item.stamp||null,'flush');
+        if(!mres||!mres.ok){failed.push(item);continue;} /* stays queued; mergeAndWriteJob logged why */
+        flushed++;removeQueued(LS_QUEUE,x=>x.type===item.type&&x.id===item.id&&x.ts===item.ts);
+        if(mres.wrote)writeJobSnapshot(item.id,mres.merged);
+        continue;
       }
       else if(item.type==='farm')call=sb.from('farms').upsert({id:item.id,contractor_slug:CONTRACTOR_SLUG,data:item.data},{onConflict:'id'});
       else if(item.type==='crew')call=sb.from('crew_members').upsert({id:item.id,contractor_slug:CONTRACTOR_SLUG,data:item.data},{onConflict:'id'});
@@ -1425,6 +1437,7 @@ async function dbLoad(){
          simply carrying an old copy. Stripped by buildStrippedJobBlob, so it is
          never persisted. */
       jobs:(jr.data||[]).map(r=>({...r.data,
+        _srvTree:buildStamp(r.data||{}), /* v4.6.72h - the full stamp tree; the markers below stay one release as fallback */
         _srvStatus:(r.data||{}).status,
         _srvRates:JSON.stringify((r.data||{}).rates||{}),
         /* v4.6.69 — crew membership too. See guard_crew_kept. */
@@ -1794,6 +1807,7 @@ function buildStrippedJobBlob(job){
   delete out._srvMobRates;
   delete out._srvMobMeta; /* v4.6.72e */
   delete out._srvCrew; /* v4.6.69 */
+  delete out._srvTree; /* v4.6.72h */
   return out;
 }
 
@@ -1868,404 +1882,307 @@ async function deleteSundryEntry(id){
   if(r&&r.error)throw new Error(r.error.message);
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   v4.6.72h (25 Oct 2026) — ONE WRITE ROUTINE FOR jobs.data
+   A job is one blob written whole, last write wins. Every incident since May
+   was a device writing an older copy over a newer one. The field guards added
+   since ran only on the direct save, only when their 3-second reads succeeded,
+   and a refused or timed-out blob was QUEUED and later flushed raw with no
+   guard at all. Knights MCIN-0030, 25 Oct: a blob queued on Friday 2:38pm
+   flushed on Sunday 4:23pm over 7 crew and a date change - no guard, no log,
+   no snapshot. PYLA-0035 lost 9 crew the same way; CLEA-0095 was un-charged
+   three times. Rules now:
+     R1 every write of jobs.data goes through mergeAndWriteJob - direct save,
+        queue flush, sync-on-open. There is no raw upsert of a job anywhere.
+     R2 a device can only change what it changed. Per field, at every level,
+        if the outgoing value equals the stamp (what this device last saw from
+        or last held when it wrote to the server) and the server now differs,
+        the server wins. A value that differs from the stamp is a deliberate
+        edit and is written through.
+     R3 guards are mandatory. If the reads cannot complete, nothing is written:
+        the blob is queued WITH its stamp and merged later.
+     R4 nothing is refused-then-queued. A stale blob merges to a no-op. Work is
+        protected as a merge rule: a run with cells, or a person with work, is
+        never dropped by any write.
+     R5 queued blobs carry their stamp and merge at flush time.
+     R6 writes are conditional on the row's updated_at; conflict = re-merge.
+     R7 a merge that changes nothing writes nothing.
+   No stamp at all (a blob queued by the previous build, or a cache-only first
+   save after upgrade): scalars take the server's value, sets take the union.
+   A legacy blob can only add, never remove or revert.
+   ══════════════════════════════════════════════════════════════════════════ */
+function fnv1a(str){let h=0x811c9dc5;for(let i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,0x01000193)>>>0;}return h.toString(36);}
+const hv=v=>fnv1a(canonJSON(v===undefined?null:v));
+/* handled structurally, never as opaque top-level fields */
+const MERGE_STRUCT_KEYS=['id','crew','runs','rates','status'];
+/* emptied by buildStrippedJobBlob - tally_entries / sundries_entries own them */
+const MERGE_STRIPPED_KEYS=['shedTallies','shedRoleRuns','baleTallies','baleWeights','travelTallies','messTallies','cookDays','cookHeads','sundries'];
+/* rates sub-objects keyed by crew id - merged item by item, not as one value */
+const RATES_MAP_KEYS=['crewDetails','shearerOverrides','shearerLoadings','loadingType','gangerByDate'];
+const mobFields=m=>{const o={...(m||{})};delete o.counts;delete o._synth;return o;};
+function hashFields(obj){const h={};Object.keys(obj||{}).forEach(k=>{h[k]=hv(obj[k]);});return h;}
+function runStamp(run){const rest={...(run||{})};delete rest.mobs;const mobs={};((run&&run.mobs)||[]).forEach(m=>{if(m&&m.id)mobs[m.id]=hashFields(mobFields(m));});return {f:hashFields(rest),mobs};}
+function dayStamp(dayRuns){const d={};(dayRuns||[]).forEach(r=>{if(r&&r.id)d[r.id]=runStamp(r);});return d;}
+/* The stamp: a hash tree of a blob as this device last saw it on the server. */
+function buildStamp(blob){
+  const b=blob||{};
+  const t={v:1,top:{},rates:{},ratesMaps:{},runs:{},crew:(Array.isArray(b.crew)?b.crew.filter(Boolean):[]),status:hv(b.status==null?null:b.status)};
+  Object.keys(b).forEach(k=>{if(k[0]==='_'||MERGE_STRUCT_KEYS.indexOf(k)>=0||MERGE_STRIPPED_KEYS.indexOf(k)>=0)return;t.top[k]=hv(b[k]);});
+  const r=(b.rates&&typeof b.rates==='object')?b.rates:{};
+  Object.keys(r).forEach(k=>{
+    if(RATES_MAP_KEYS.indexOf(k)>=0&&r[k]&&typeof r[k]==='object'&&!Array.isArray(r[k])){const m={};Object.keys(r[k]).forEach(id=>{const v=r[k][id];m[id]=(v&&typeof v==='object'&&!Array.isArray(v))?hashFields(v):hv(v);});t.ratesMaps[k]=m;}
+    else t.rates[k]=hv(r[k]);
+  });
+  Object.entries(b.runs||{}).forEach(([date,dayRuns])=>{t.runs[date]=dayStamp(dayRuns);});
+  return t;
+}
+/* Markers written by v4.6.30-72g loads (_srvStatus/_srvRates/_srvCrew) -> a
+   partial stamp, so a job cached by the previous build keeps status, rates and
+   crew protection on its first save after upgrade. Parts with no stamp follow
+   the no-stamp rule. */
+function stampFromLegacy(job){
+  if(!job||(job._srvStatus==null&&!job._srvRates&&!job._srvCrew))return null;
+  let rates=null;try{rates=job._srvRates?JSON.parse(job._srvRates):null;}catch(e){rates=null;}
+  let crew=null;try{crew=job._srvCrew?JSON.parse(job._srvCrew):null;}catch(e){crew=null;}
+  const t=buildStamp({rates:rates||{}});
+  t.v=0;t.top=null;t.runs=null;
+  if(!rates){t.rates=null;t.ratesMaps=null;}
+  t.crew=Array.isArray(crew)?crew:null;
+  t.status=(job._srvStatus==null)?null:hv(job._srvStatus);
+  return t;
+}
+/* The stamp this device is judged against: post-save Map first, then the
+   load-time tree on the job, then the legacy markers, else nothing. */
+function stampTreeFor(job){
+  const m=_srvStamp.get(job.id);
+  if(m&&m.tree)return m.tree;
+  if(job._srvTree&&typeof job._srvTree==='object'&&job._srvTree.v!==undefined)return job._srvTree;
+  return stampFromLegacy(job);
+}
+/* R2 for one value. tHash null = no stamp for this part -> `fallback` side wins. */
+function pickVal(o,s,tHash,path,kept,fallback){
+  const ho=hv(o),hs=hv(s);
+  if(ho===hs)return o;
+  if(tHash==null){if(fallback==='server'){kept.push(path);return s;}return o;}
+  if(ho===tHash){kept.push(path);return s;}
+  return o;
+}
+/* R2 across the keys of two flat objects. t = {key:hash} or null (no stamp). */
+function mergeFields(o,s,t,path,kept){
+  o=o||{};s=s||{};const noStamp=(t==null);t=t||{};const res={};
+  new Set([...Object.keys(o),...Object.keys(s)]).forEach(k=>{
+    const inO=(k in o),inS=(k in s),inT=(k in t);const p=path?path+'.'+k:k;
+    if(inO&&inS)res[k]=pickVal(o[k],s[k],(noStamp||!inT)?null:t[k],p,kept,noStamp?'server':'device');
+    else if(inS){if(noStamp||!inT){kept.push(p);res[k]=s[k];}}          /* never saw it: keep. saw it and removed it: stays removed */
+    else{if(!noStamp&&inT&&hv(o[k])===t[k]){kept.push(p+':gone');}else res[k]=o[k];} /* removed elsewhere while untouched here: drop; else ours */
+  });
+  return res;
+}
+/* three-way on a map keyed by id (crewDetails, shearerOverrides...). An object
+   value is merged field by field against a per-field stamp; a scalar value as
+   one. t = {id: {field:hash} | hash} or null (no stamp). */
+function mergeMapOfObjects(o,s,t,path,kept){
+  o=o||{};s=s||{};const noStamp=(t==null);t=t||{};const res={};
+  const isObj=v=>v&&typeof v==='object'&&!Array.isArray(v);
+  const same=(v,tv)=>isObj(tv)?(isObj(v)&&canonJSON(hashFields(v))===canonJSON(tv)):(typeof tv==='string'&&hv(v)===tv);
+  new Set([...Object.keys(o),...Object.keys(s)]).forEach(id=>{
+    const inO=(id in o),inS=(id in s),inT=(id in t);const p=path+'.'+id;
+    if(inO&&inS){
+      if(isObj(o[id])&&isObj(s[id]))res[id]=mergeFields(o[id],s[id],(noStamp||!inT||!isObj(t[id]))?null:t[id],p,kept);
+      else res[id]=pickVal(o[id],s[id],(noStamp||!inT||typeof t[id]!=='string')?null:t[id],p,kept,noStamp?'server':'device');
+    }
+    else if(inS){if(noStamp||!inT){kept.push(p);res[id]=s[id];}}
+    else{if(!noStamp&&inT&&same(o[id],t[id])){kept.push(p+':gone');}else res[id]=o[id];}
+  });
+  return res;
+}
+/* three-way on a set (crew). Device order kept, server-only members appended. */
+function mergeSet(oArr,sArr,tArr,path,kept){
+  const o=(oArr||[]).filter(Boolean),s=(sArr||[]).filter(Boolean);const noStamp=(tArr==null);const t=new Set(tArr||[]);const sS=new Set(s),oS=new Set(o);const res=[];
+  o.forEach(id=>{if(sS.has(id))res.push(id);else{if(!noStamp&&t.has(id)){kept.push(path+'.'+id+':gone');}else res.push(id);}});
+  s.forEach(id=>{if(!oS.has(id)){if(noStamp||!t.has(id)){kept.push(path+'.'+id);res.push(id);}}});
+  return res;
+}
+function mergeRun(o,s,tr,path,kept){
+  const noStamp=(tr==null);
+  const oRest={...o};delete oRest.mobs;const sRest={...s};delete sRest.mobs;
+  const rest=mergeFields(oRest,sRest,noStamp?null:tr.f,path,kept);
+  const oM={},sM={},order=[];
+  (o.mobs||[]).forEach(m=>{if(m&&m.id){oM[m.id]=m;order.push(m.id);}});
+  (s.mobs||[]).forEach(m=>{if(m&&m.id){sM[m.id]=m;if(order.indexOf(m.id)<0)order.push(m.id);}});
+  const tm=noStamp?null:(tr.mobs||{});const mobs=[];
+  order.forEach(id=>{
+    const om=oM[id],sm=sM[id],th=tm?tm[id]:undefined;const p=path+'.'+id;
+    if(om&&sm){const f=mergeFields(mobFields(om),mobFields(sm),(tm&&th)?th:null,p,kept);mobs.push({...f,counts:{}});}
+    else if(sm){if(!tm||th===undefined){kept.push(p);mobs.push(sm);}}
+    else{if(tm&&th!==undefined&&canonJSON(hashFields(mobFields(om)))===canonJSON(th)){kept.push(p+':gone');}else mobs.push(om);}
+  });
+  /* mobs with no id (should not exist) travel with the device */
+  (o.mobs||[]).forEach(m=>{if(m&&!m.id)mobs.push(m);});
+  return {...rest,mobs};
+}
+function mergeDay(oDay,sDay,tDay,path,kept){
+  const noStamp=(tDay==null);const oM={},sM={},order=[];
+  (oDay||[]).forEach(r=>{if(r&&r.id){oM[r.id]=r;order.push(r.id);}});
+  (sDay||[]).forEach(r=>{if(r&&r.id){sM[r.id]=r;if(order.indexOf(r.id)<0)order.push(r.id);}});
+  const out=[];
+  order.forEach(id=>{
+    const o=oM[id],s=sM[id],tr=noStamp?undefined:tDay[id];const p=path+'.'+id;
+    if(o&&s)out.push(mergeRun(o,s,(noStamp||tr===undefined)?null:tr,p,kept));
+    else if(s){if(noStamp||tr===undefined){kept.push(p);out.push(s);}}
+    else{if(!noStamp&&tr!==undefined&&canonJSON(runStamp(o))===canonJSON(tr)){kept.push(p+':gone');}else out.push(o);}
+  });
+  (oDay||[]).forEach(r=>{if(r&&!r.id)out.push(r);});
+  return out;
+}
+function mergeRuns(oRuns,sRuns,tRuns,kept){
+  oRuns=oRuns||{};sRuns=sRuns||{};const noStamp=(tRuns==null);const res={};
+  new Set([...Object.keys(oRuns),...Object.keys(sRuns)]).forEach(date=>{
+    const inO=(date in oRuns),inS=(date in sRuns),inT=!noStamp&&(date in tRuns);const p='runs.'+date;
+    if(inO&&inS)res[date]=mergeDay(oRuns[date]||[],sRuns[date]||[],inT?tRuns[date]:null,p,kept);
+    else if(inS){if(noStamp||!inT){kept.push(p);res[date]=sRuns[date];}}
+    else{if(inT&&canonJSON(dayStamp(oRuns[date]))===canonJSON(tRuns[date])){kept.push(p+':gone');}else res[date]=oRuns[date];}
+  });
+  return res;
+}
+/* Pure. outgoing = this device's stripped blob, srv = the server's blob, tree =
+   stampTreeFor(...) or null. Returns the blob to write; `kept` lists every path
+   where the server's value was kept over the device's. Each section falls back
+   to the device's value on an internal error so a bug here can never make a
+   job unsaveable - but it logs, loudly. */
+function mergeJob(outgoing,srv,tree,kept){
+  const o=outgoing||{},s=srv||{};const noStamp=!tree;const T=tree||{};const res={};
+  const section=(name,fn,fallback)=>{try{return fn();}catch(e){logSaveFailure('merge_section_error',o.id||s.id||null,name+';'+(e&&e.message||'unknown'));return fallback;}};
+  res.id=o.id||s.id;
+  /* top-level opaque fields */
+  Object.assign(res,section('top',()=>{
+    const topT=(noStamp||T.top==null)?null:T.top;const out={};
+    new Set([...Object.keys(o),...Object.keys(s)]).forEach(k=>{
+      if(k[0]==='_'||MERGE_STRUCT_KEYS.indexOf(k)>=0)return;
+      if(MERGE_STRIPPED_KEYS.indexOf(k)>=0){if(k in o)out[k]=o[k];return;}
+      const inO=(k in o),inS=(k in s),inT=!!topT&&(k in topT);
+      if(inO&&inS)out[k]=pickVal(o[k],s[k],(!topT||!inT)?null:topT[k],k,kept,topT?'device':'server');
+      else if(inS){if(!topT||!inT){kept.push(k);out[k]=s[k];}}
+      else{if(topT&&inT&&hv(o[k])===topT[k]){kept.push(k+':gone');}else out[k]=o[k];}
+    });
+    return out;
+  },(()=>{const out={};Object.keys(o).forEach(k=>{if(k[0]!=='_'&&MERGE_STRUCT_KEYS.indexOf(k)<0)out[k]=o[k];});return out;})()));
+  res.status=section('status',()=>pickVal(o.status,s.status,(noStamp||T.status==null)?null:T.status,'status',kept,(noStamp||T.status==null)?'server':'device'),o.status);
+  res.crew=section('crew',()=>mergeSet(o.crew,s.crew,(noStamp||T.crew==null)?null:T.crew,'crew',kept),(o.crew||[]).slice());
+  res.rates=section('rates',()=>{
+    const oR=(o.rates&&typeof o.rates==='object')?o.rates:{},sR=(s.rates&&typeof s.rates==='object')?s.rates:{};
+    const rT=(noStamp||T.rates==null)?null:T.rates,mT=(noStamp||T.ratesMaps==null)?null:T.ratesMaps;const out={};
+    new Set([...Object.keys(oR),...Object.keys(sR)]).forEach(k=>{
+      const p='rates.'+k;
+      if(RATES_MAP_KEYS.indexOf(k)>=0){const m=mergeMapOfObjects(oR[k],sR[k],(mT&&mT[k])?mT[k]:(mT?{}:null),p,kept);if((k in oR)||(k in sR))out[k]=m;return;}
+      const inO=(k in oR),inS=(k in sR),inT=!!rT&&(k in rT);
+      if(inO&&inS)out[k]=pickVal(oR[k],sR[k],(!rT||!inT)?null:rT[k],p,kept,rT?'device':'server');
+      else if(inS){if(!rT||!inT){kept.push(p);out[k]=sR[k];}}
+      else{if(rT&&inT&&hv(oR[k])===rT[k]){kept.push(p+':gone');}else out[k]=oR[k];}
+    });
+    return out;
+  },{...(o.rates||{})});
+  res.runs=section('runs',()=>mergeRuns(o.runs,s.runs,(noStamp||T.runs==null)?null:T.runs,kept),{...(o.runs||{})});
+  return res;
+}
+/* The one write path. Returns {ok:true,wrote,merged,kept} or {ok:false,why}.
+   On ok:false the CALLER queues the blob with its stamp. Never throws. */
+async function mergeAndWriteJob(jobId,outgoing,tree,origin){
+  const RT=8000;
+  const read=async(mk,label)=>{let last;for(let i=0;i<2;i++){try{const r=await withTimeout(mk(),RT,label);if(r&&r.error)throw new Error(r.error.message);return r;}catch(e){last=e;}}throw last;};
+  for(let attempt=0;attempt<3;attempt++){
+    let srvRow;
+    try{srvRow=await read(()=>sb.from('jobs').select('data,updated_at').eq('id',jobId).eq('contractor_slug',CONTRACTOR_SLUG).maybeSingle(),'merge_read_timeout');}
+    catch(e){logSaveFailure('merge_unavailable_queued',jobId,origin+';read;'+(e&&e.message||''));return {ok:false,why:'read'};}
+    const srv=(srvRow&&srvRow.data&&srvRow.data.data&&typeof srvRow.data.data==='object')?srvRow.data.data:null;
+    const srvUpdated=(srvRow&&srvRow.data)?srvRow.data.updated_at:null;
+    const nowIso=new Date().toISOString();
+    if(!srv){
+      /* no row: a job created on this device. Insert; a conflict means it appeared meanwhile - loop and merge. */
+      try{
+        const r=await withTimeout(sb.from('jobs').insert({id:jobId,contractor_slug:CONTRACTOR_SLUG,data:outgoing,updated_at:nowIso}).select('id'),12000,'upsert_timeout');
+        if(r&&r.error){if(/duplicate|23505|conflict|already exists/i.test(r.error.message||''))continue;throw new Error(r.error.message);}
+        return {ok:true,wrote:true,merged:outgoing,kept:[]};
+      }catch(e){logSaveFailure(e.message==='upsert_timeout'?'timeout':'error',jobId,origin+';insert;'+(e&&e.message||''));return {ok:false,why:'write'};}
+    }
+    const kept=[];
+    const merged=mergeJob(outgoing,srv,tree,kept);
+    /* work rules - R4. Reads are mandatory (R3). */
+    try{
+      const runIds=new Set();Object.values(merged.runs||{}).forEach(d=>(d||[]).forEach(r=>{if(r&&r.id)runIds.add(r.id);}));
+      const rr=await read(()=>{let q=sb.from('tally_entries').select('run_id').eq('contractor_slug',CONTRACTOR_SLUG).eq('job_id',jobId).eq('kind','count').not('run_id','eq','').limit(20000);if(runIds.size)q=q.not('run_id','in','('+[...runIds].join(',')+')');return q;},'merge_runids_timeout');
+      const missing=[...new Set((rr.data||[]).map(x=>x&&x.run_id).filter(Boolean))];
+      if(missing.length){
+        const restored=[],orphan=[];
+        const find=(runs,rid)=>{let f=null;Object.entries(runs||{}).forEach(([date,d])=>{(d||[]).forEach(r=>{if(r&&r.id===rid&&!f)f={date,run:r};});});return f;};
+        missing.forEach(rid=>{const f=find(srv.runs,rid)||find(outgoing.runs,rid);
+          if(f){merged.runs=merged.runs||{};merged.runs[f.date]=merged.runs[f.date]||[];if(!merged.runs[f.date].some(r=>r&&r.id===rid))merged.runs[f.date].push(f.run);restored.push(rid);}
+          else orphan.push(rid);});
+        if(restored.length)logSaveFailure('guard_shrink_restored',jobId,origin+';'+restored.join(',').slice(0,400));
+        if(orphan.length)logSaveFailure('merge_orphan_runs',jobId,origin+';'+orphan.join(',').slice(0,400));
+      }
+      const crewNow=(merged.crew||[]).slice();
+      const cr=await read(()=>{let q=sb.from('tally_entries').select('crew_id').eq('contractor_slug',CONTRACTOR_SLUG).eq('job_id',jobId).in('kind',['count','shed_runs','bales','bale_kg','cook_day']).gt('value',0).limit(50);if(crewNow.length)q=q.not('crew_id','in','('+crewNow.join(',')+')');return q;},'merge_work_timeout');
+      const restoreCrew=[...new Set((cr.data||[]).map(x=>x&&x.crew_id).filter(Boolean))].filter(id=>crewNow.indexOf(id)<0);
+      if(restoreCrew.length){
+        merged.crew=crewNow.concat(restoreCrew);
+        merged.rates=merged.rates||{};merged.rates.crewDetails={...(merged.rates.crewDetails||{})};
+        restoreCrew.forEach(id=>{const d=((srv.rates||{}).crewDetails||{})[id]||((outgoing.rates||{}).crewDetails||{})[id];if(d&&!merged.rates.crewDetails[id])merged.rates.crewDetails[id]=d;});
+        logSaveFailure('guard_crew_restored',jobId,origin+';restored='+restoreCrew.join(','));
+      }
+    }catch(e){logSaveFailure('merge_unavailable_queued',jobId,origin+';work;'+(e&&e.message||''));return {ok:false,why:'read'};}
+    try{dedupeRuns(merged,'merge');}catch(e){}
+    /* R7 */
+    if(canonJSON(merged)===canonJSON(srv)){
+      if(kept.length)logSaveFailure('merge_noop_kept',jobId,origin+';'+kept.join(',').slice(0,460));
+      return {ok:true,wrote:false,merged,kept};
+    }
+    /* R6 */
+    try{
+      let w=sb.from('jobs').update({data:merged,updated_at:nowIso}).eq('id',jobId).eq('contractor_slug',CONTRACTOR_SLUG);
+      if(srvUpdated)w=w.eq('updated_at',srvUpdated);
+      const r=await withTimeout(w.select('id'),12000,'upsert_timeout');
+      if(r&&r.error)throw new Error(r.error.message);
+      if(!r||!Array.isArray(r.data)||r.data.length===0){logSaveFailure('merge_conflict_retry',jobId,origin+';attempt='+attempt);continue;}
+      if(kept.length)logSaveFailure('merge_kept',jobId,origin+';'+kept.join(',').slice(0,460));
+      return {ok:true,wrote:true,merged,kept};
+    }catch(e){logSaveFailure(e.message==='upsert_timeout'?'timeout':'error',jobId,origin+';'+(e&&e.message||''));return {ok:false,why:'write'};}
+  }
+  logSaveFailure('merge_conflict_exhausted',jobId,origin);
+  return {ok:false,why:'conflict'};
+}
+/* snapshot after any successful write - fire and forget, 3s, as before */
+function writeJobSnapshot(jobId,data){
+  try{
+    withTimeout(
+      sb.from('job_snapshots').upsert({contractor_slug:CONTRACTOR_SLUG,job_id:jobId,snapshot_date:localToday(),data:data,updated_at:new Date().toISOString()},{onConflict:'contractor_slug,job_id,snapshot_date'}).then(r=>{
+        if(r&&r.error)logSaveFailure('snapshot_error',jobId,r.error.message);
+      }),
+      3000,'snapshot_timeout'
+    ).catch(err=>{logSaveFailure(err.message==='snapshot_timeout'?'snapshot_timeout':'snapshot_error',jobId,err.message);});
+  }catch(snapErr){ /* never break the save flow */ }
+}
 async function dbSaveJob(job){
   /* LS_JOBS — keep FULL job (tallies included). This is the offline
-     fallback when tally_entries can't be queried. Stripping here would
-     leave offline users with empty cells. */
+     fallback when tally_entries can't be queried. */
   const jobs=lsGet(LS_JOBS)||[];
   const updated=jobs.find(j=>j.id===job.id)?jobs.map(j=>j.id===job.id?job:j):[job,...jobs];
   lsSet(LS_JOBS,updated);
   /* Supabase write — STRIPPED. tally_entries is the source of truth for
      tally cells; jobs.data only carries structure. */
   const jobForBlob=buildStrippedJobBlob(job);
-  /* Skip Supabase entirely if offline — avoids SW stub returning fake 200 */
-  if(!navigator.onLine){
-    queueWrite('job',job.id,jobForBlob);
-    return;
-  }
-  /* Online path: cap the upsert at 5 seconds to prevent silent hangs.
-     A hanging upsert on poor signal that never resolves is the EXACT
-     bug pattern that wiped a live job — without a timeout
-     the await never returns, the catch block never fires, and the data
-     never makes it to the queue. */
-  try{
-    /* v4.6.3 — Save-time guard against shrinking runs.
-       Before writing jobs.data to Supabase, check tally_entries for the
-       distinct run_ids that have cell data for this job. If the
-       about-to-save blob is MISSING any of those run_ids, that means our
-       React state has a runs structure that's truncated relative to
-       reality. Refuse the save, queue for retry, log.
-
-       This is the structural fix for the 21 May 2026 incident
-       where a laptop wrote a 3-run blob over a 10-run state, leaving
-       Wed and Thu cells orphaned in tally_entries with no run structure
-       to display them under. */
-    try{
-      const tallyRunIdsResult=await withTimeout(
-        /* v4.6.55 — explicit ceiling. A long shed already reaches ~900 count
-           rows; at the server default this guard would silently see a partial
-           set of run ids. */
-        sb.from('tally_entries')
-          .select('run_id')
-          .eq('contractor_slug',CONTRACTOR_SLUG)
-          .eq('job_id',job.id)
-          .limit(20000)
-          .eq('kind','count')
-          .not('run_id','eq',''),
-        3000,
-        'guard_runids_timeout'
-      ).catch(err=>({error:{message:'guard_runids_failed:'+err.message}}));
-      if(tallyRunIdsResult&&!tallyRunIdsResult.error&&Array.isArray(tallyRunIdsResult.data)){
-        const tallyRunIds=new Set(tallyRunIdsResult.data.map(r=>r.run_id).filter(Boolean));
-        if(tallyRunIds.size>0){
-          const blobRunIds=new Set();
-          Object.values((jobForBlob&&jobForBlob.runs)||{}).forEach(dayRuns=>{
-            (dayRuns||[]).forEach(run=>{if(run&&run.id)blobRunIds.add(run.id);});
-          });
-          const missing=[...tallyRunIds].filter(rid=>!blobRunIds.has(rid));
-          if(missing.length>0){
-            logSaveFailure(
-              'guard_rejected_shrink_save',
-              job.id,
-              'missing_run_ids='+missing.join(',')+';blob_count='+blobRunIds.size+';tally_count='+tallyRunIds.size
-            );
-            /* Queue the FULL job (with all original structure preserved from
-               React state) so the next save attempt retries. Don't write
-               this incomplete state to Supabase. */
-            queueWrite('job',job.id,jobForBlob);
-            return;
-          }
-        }
-      }
-    }catch(guardErr){
-      /* Guard query itself failed (network, timeout). Don't block the save
-         on a failed guard — fall through to the legacy pre-save guard and
-         normal upsert. We'd rather risk a partial save than refuse every
-         save on a flaky network. */
-      logSaveFailure('guard_query_error',job.id,(guardErr&&guardErr.message)||'unknown');
-    }
-    /* PATCH v4.5.0 — Pre-save guard (preserved). Now operates on stripped
-       blob, but the run-DATE keys are unchanged by stripping (only the
-       counts within mobs are emptied), so the guard still functions as
-       designed: rejects writes that would shrink the run-date history. */
-    const incomingRunDates=Object.keys((jobForBlob&&jobForBlob.runs)||{}).length;
-    /* v4.6.30 — was `incomingRunDates>0`, so a job with crew but no runs yet was
-       never compared against the server at all and could lose crew unseen. */
-    {
-      const guardCheck=await withTimeout(
-        sb.from('jobs').select('data').eq('id',job.id).eq('contractor_slug',CONTRACTOR_SLUG).maybeSingle(),
-        3000,
-        'guard_timeout'
-      ).catch(err=>({error:{message:'guard_check_failed:'+err.message}}));
-      if(guardCheck&&!guardCheck.error&&guardCheck.data&&guardCheck.data.data){
-        const srv=guardCheck.data.data;
-        /* ══ v4.6.30 — STALE-DEVICE CREW WIPE ════════════════════════════════
-           A job is stored as one blob and written whole, last write wins. A
-           second device holding an older copy can therefore delete a crew member
-           who was added on another device — and the run guard below never sees
-           it, because it only compares RUN ids.
-
-           That is exactly what happened on 25 Aug: a device still holding the
-           23rd's 10-person crew pressed Completed. The save wrote its whole copy,
-           the crew went 11 back to 10, and a wool handler with 5 runs recorded
-           silently vanished from the pay summary. Her tally rows were never
-           touched — tally_entries is a separate table — so the work was there the
-           whole time and only the crew list lost her. She was not paid.
-
-           Fix: anyone on the SERVER's crew list who holds tally rows for this job
-           is merged back into the outgoing blob. Never refuses the save — a
-           refusal here would make a job unsaveable, which is worse than the bug.
-           Someone with no recorded work can still be removed normally. */
-        try{
-          /* ══ v4.6.43 — ANCHOR THE GUARD TO THE WORK, NOT TO THE SERVER LIST ══
-             The v4.6.30 version only ever considered people already on the
-             SERVER's crew list:  dropped = srvCrew.filter(not in outCrew).
-             So it caught the SECOND wipe and never the first. Once any save had
-             removed someone from the server copy, every later save agreed they
-             were absent and their tally rows were irrelevant — they could not
-             enter `dropped`, so they could never be restored.
-
-             3 Sep: a shearer with 200 head across four runs was invisible on a
-             12-person job. His rows were in tally_entries the whole time; only
-             the crew list had lost him, and the guard was structurally blind to
-             him. The board read 892 shorn against a true 1092.
-
-             The rule is simply: anyone with recorded WORK on this job belongs on
-             its crew list, whatever the server currently says.
-
-             value>0 is deliberate. Restoring on the mere existence of a row
-             would make anyone with a leftover zero-value cell permanently
-             unremovable — a live complaint on another contractor. Zero work,
-             removable as normal. */
-          const outCrew=Array.isArray(jobForBlob.crew)?jobForBlob.crew.slice():[];
-          /* v4.6.43a — ask the server ONLY for crew who hold work on this job and
-             are NOT already on the outgoing list. Normally that is zero rows, so
-             this is cheap on the wire even on a bad link.
-
-             v4.6.43 tried to avoid the round trip by reusing the shrink-guard
-             query. That query filters kind='count' AND run_id<>'', which is how
-             SHEARERS are stored. Every wool handler, classer and presser is
-             kind='shed_runs' with a blank run_id — 1,936 rows across 164 people
-             fleet-wide, none of them visible to that filter. It would have
-             protected shearers and silently dropped the protection for the wool
-             handler this guard was built for on 25 Aug. Correctness first: take
-             the extra request.
-
-             Kinds are limited to actual WORK. mess and travel are attendance
-             attributes and are the likeliest rows to be left behind after a
-             deliberate removal; restoring on those would resurrect someone the
-             lead meant to take off, and a stray mess row would re-apply a
-             DEDUCTION to them. */
-          let crewOrphans=null;
-          try{
-            let cq=sb.from('tally_entries').select('crew_id')
-              .eq('contractor_slug',CONTRACTOR_SLUG).eq('job_id',job.id)
-              .in('kind',['count','shed_runs','bales','bale_kg','cook_day'])
-              .gt('value',0).limit(50);
-            if(outCrew.length>0)cq=cq.not('crew_id','in','('+outCrew.join(',')+')');
-            const cr2=await withTimeout(cq,3000,'guard_crew_timeout')
-              .catch(err=>({error:{message:'guard_crew_failed:'+err.message}}));
-            if(cr2&&!cr2.error&&Array.isArray(cr2.data))crewOrphans=cr2.data;
-          }catch(cErr){ /* fail open — a guard must never block a save */ }
-          const withWork=[...new Set((crewOrphans||[]).map(r=>r&&r.crew_id).filter(Boolean))];
-          const restore=withWork.filter(cid=>outCrew.indexOf(cid)<0);
-          if(restore.length>0){
-            restore.forEach(cid=>outCrew.push(cid));
-            jobForBlob.crew=outCrew;
-            logSaveFailure('guard_crew_restored',job.id,
-              'restored='+restore.join(',')+';srv='+((srv.crew||[]).length)+';incoming='+
-              ((job.crew||[]).length));
-          }
-        }catch(crewErr){
-          logSaveFailure('guard_crew_error',job.id,(crewErr&&crewErr.message)||'unknown');
-        }
-        /* ══ v4.6.30 — STATUS FLAPPING ═══════════════════════════════════════
-           Same root cause: a stale device kept reverting a Completed job to
-           Active. _srvStatus is the status this device last saw on the server.
-           If it still matches what we are about to write, this device is not
-           changing the status — it is carrying an old value — so keep whatever
-           the server has now. A genuine change by this user differs from the
-           stamp and is written through untouched. */
-        /* v4.6.43 — read via stampFor, so the stamp reflects this device's last
-           successful SAVE as well as its last load. Rule itself is unchanged. */
-        const _stamp=stampFor(job);
-        if(_stamp.status&&jobForBlob.status===_stamp.status&&srv.status&&srv.status!==jobForBlob.status){
-          logSaveFailure('guard_status_kept',job.id,
-            'device_had='+_stamp.status+';server_now='+srv.status);
-          jobForBlob.status=srv.status;
-        }
-        /* v4.6.30 — rates carry the same exposure and it is the one that moves
-           money: a stale device reverting a rate change would silently reprice
-           the whole job for everyone on it. Same rule — if this device did not
-           touch the rates, it has no business overwriting them. */
-        try{
-          if(_stamp.rates&&srv.rates){
-            /* v4.6.43 — canonJSON on both sides: key insertion order no longer
-               decides whether this guard fires. */
-            const outRates=canonJSON(jobForBlob.rates||{});
-            const srvRates=canonJSON(srv.rates||{});
-            if(outRates===_stamp.rates&&srvRates!==outRates){
-              logSaveFailure('guard_rates_kept',job.id,'device_unchanged;server_differs');
-              jobForBlob.rates=srv.rates;
-            }
-          }
-        }catch(rateErr){
-          logSaveFailure('guard_rates_error',job.id,(rateErr&&rateErr.message)||'unknown');
-        }
-        /* ══ v4.6.69 — CREW MEMBERSHIP, NOT JUST CREW WITH WORK ═══════════════
-           guard_crew_restored (v4.6.32) puts back anyone on the server crew who
-           has tally rows. That saved a wool handler's five runs. It cannot save
-           someone who has just been added: no tallies, nothing to restore from.
-           A wool handler was added to a live job, texted her card, and wiped by a
-           stale device — three times in one morning, with four guard_rates_kept
-           entries on the same job proving the stale device was there.
-
-           Same rule as rates and status: if this device's outgoing crew is
-           exactly what it last saw from the server, it has not touched the crew,
-           and the server's list — which may hold someone added elsewhere — wins.
-           A device that added or removed anyone differs from its stamp and is
-           written through, so a deliberate edit is never undone. */
-        try{
-          if(_stamp.crew&&Array.isArray(srv.crew)){
-            /* Compare what THIS DEVICE meant to send (job.crew, untouched) — not
-               jobForBlob.crew, which the work guard above may already have
-               restored someone into. Otherwise a restore of one person made the
-               crew look "changed" and silently cost a second person who had no
-               tallies yet. */
-            const outCrew=JSON.stringify((job.crew||[]).slice().sort());
-            const srvCrew=JSON.stringify((srv.crew||[]).slice().sort());
-            if(outCrew===_stamp.crew&&srvCrew!==outCrew){
-              const kept=(srv.crew||[]).filter(id=>(jobForBlob.crew||[]).indexOf(id)<0);
-              logSaveFailure('guard_crew_kept',job.id,'device_unchanged;server_differs;kept='+kept.join(','));
-              jobForBlob.crew=srv.crew.slice();
-              /* their job-role snapshot travels with them */
-              if(srv.rates&&srv.rates.crewDetails){
-                jobForBlob.rates=jobForBlob.rates||{};
-                jobForBlob.rates.crewDetails={...(jobForBlob.rates.crewDetails||{})};
-                kept.forEach(id=>{if(srv.rates.crewDetails[id]&&!jobForBlob.rates.crewDetails[id])
-                  jobForBlob.rates.crewDetails[id]=srv.rates.crewDetails[id];});
-              }
-            }
-          }
-        }catch(crewErr){
-          logSaveFailure('guard_crew_error',job.id,(crewErr&&crewErr.message)||'unknown');
-        }
-        /* v4.6.34 — per-mob rate overrides. Same rule as the others: if this
-           device is carrying the same value it last saw, it is not changing the
-           override and has no business clearing one set elsewhere. A deliberate
-           clear differs from the stamp and is written through. */
-        try{
-          const stamp=_stamp.mobRates;
-          const srvMob=mobRateMap(srv.runs);
-          const restored=[];
-          /* v4.6.42 — the guard had five exits and only two of them spoke, so a
-             lost override left no evidence at all. Every mob whose outgoing
-             value disagrees with the server now records the verdict that
-             decided it. A mob that agrees with the server cannot lose anything,
-             so it is not recorded — on an ordinary save this writes nothing. */
-          const trace=[];
-          Object.values((jobForBlob.runs)||{}).forEach(function(dayRuns){
-            (dayRuns||[]).forEach(function(run){
-              ((run&&run.mobs)||[]).forEach(function(mob){
-                if(!mob||!mob.id)return;
-                const outVal=(mob.rateOverride===undefined?null:mob.rateOverride);
-                const inSrv=(mob.id in srvMob);
-                const srvVal=inSrv?srvMob[mob.id]:undefined;
-                let verdict;
-                if(!stamp)verdict='no_stamp';                    /* guard skipped entirely */
-                else if(!inSrv)verdict='new_on_device';          /* mob is new on this device */
-                else if(!(mob.id in stamp))verdict='unseen';     /* never seen from the server */
-                else{
-                  const seenVal=stamp[mob.id];
-                  if(String(outVal)===String(seenVal)&&String(srvVal)!==String(outVal)){
-                    mob.rateOverride=srvVal;
-                    restored.push(mob.id+':'+String(outVal)+'->'+String(srvVal));
-                    verdict='kept';
-                  }else{
-                    verdict='written_through';
-                  }
-                }
-                if(inSrv&&String(srvVal)!==String(outVal)&&trace.length<12){
-                  trace.push(mob.id+':out='+String(outVal)+';srv='+String(srvVal)
-                    +';seen='+((stamp&&(mob.id in stamp))?String(stamp[mob.id]):'?')
-                    +';'+verdict);
-                }
-              });
-            });
-          });
-          if(restored.length>0){
-            logSaveFailure('guard_mobrate_kept',job.id,restored.join(','));
-          }
-          if(trace.length>0){
-            /* v4.6.53 — was 'mobrate_trace', which escaped the DIAG_TELEMETRY gate
-               because that gate only matches /^diag_/. It fires on every mob-rate
-               comparison INCLUDING legitimate edits, so it wrote ~80 rows a week
-               across four contractors into production telemetry — the same
-               pattern that once grew save_failures to 54 MB and buried 377 real
-               failures in 11,800 rows of noise.
-               Renamed, not removed: flip DIAG_TELEMETRY to re-arm it when chasing
-               a mob-rate bug, which is what the gate exists for. */
-            logSaveFailure('diag_mobrate_trace',job.id,trace.join(' | ').slice(0,480));
-          }
-        }catch(mrErr){
-          logSaveFailure('guard_mobrate_error',job.id,(mrErr&&mrErr.message)||'unknown');
-        }
-        /* v4.6.72e — mob TYPE and DESC. If this device still carries the type/desc
-           it last saw from the server and the server now says something else,
-           someone else changed it and this device has no business reverting it.
-           A deliberate retype on this device differs from the stamp and is written
-           through. Mobs new on this device or never seen are left alone. */
-        try{
-          const mstamp=_stamp.mobMeta;
-          if(mstamp){
-            const srvMeta=mobMetaMap(srv.runs);
-            const srvMobs={};
-            Object.values((srv.runs)||{}).forEach(function(dayRuns){(dayRuns||[]).forEach(function(run){((run&&run.mobs)||[]).forEach(function(mob){if(mob&&mob.id)srvMobs[mob.id]=mob;});});});
-            const kept=[];
-            Object.values((jobForBlob.runs)||{}).forEach(function(dayRuns){
-              (dayRuns||[]).forEach(function(run){
-                ((run&&run.mobs)||[]).forEach(function(mob){
-                  if(!mob||!mob.id)return;
-                  if(!(mob.id in srvMeta)||!(mob.id in mstamp))return;
-                  /* type and desc judged separately: a device that only renamed a
-                     mob must not drag its stale type along with the rename. */
-                  const seen=String(mstamp[mob.id]).split(''),srvP=String(srvMeta[mob.id]).split('');
-                  const outT=String(mob.type==null?'':mob.type),outD=String(mob.desc==null?'':mob.desc);
-                  const sm=srvMobs[mob.id];
-                  if(outT===seen[0]&&srvP[0]!==outT){kept.push(mob.id+':type:'+outT+'->'+srvP[0]);mob.type=sm.type;}
-                  if(outD===(seen[1]||'')&&(srvP[1]||'')!==outD){kept.push(mob.id+':desc:'+outD+'->'+(srvP[1]||''));mob.desc=sm.desc;}
-                });
-              });
-            });
-            if(kept.length>0)logSaveFailure('guard_mobmeta_kept',job.id,kept.join(',').slice(0,480));
-          }
-        }catch(mmErr){
-          logSaveFailure('guard_mobmeta_error',job.id,(mmErr&&mmErr.message)||'unknown');
-        }
-        const supabaseRunDates=Object.keys((srv.runs)||{}).length;
-        if(supabaseRunDates>incomingRunDates){
-          logSaveFailure(
-            'guard_rejected_save',
-            job.id,
-            'incoming_dates='+incomingRunDates+';supabase_dates='+supabaseRunDates+';refused'
-          );
-          queueWrite('job',job.id,jobForBlob);
-          return;
-        }
-      }
-    }
-    const upsertCall=sb.from('jobs').upsert(
-      {id:job.id,contractor_slug:CONTRACTOR_SLUG,data:jobForBlob,updated_at:new Date().toISOString()},
-      {onConflict:'id'}
-    );
-    const result=await withTimeout(upsertCall,12000,'upsert_timeout');
-    if(result&&result.error)throw new Error(result.error.message);
-    dequeue('job',job.id);
-    /* v4.6.43 — the blob just written IS what the server now holds, so make it
-       this device's stamp. Only on this path: the offline, queued and rejected
-       paths all return before the upsert and have learned nothing. */
-    try{
-      _srvStamp.set(job.id,{
-        status:jobForBlob.status,
-        rates:canonJSON(jobForBlob.rates||{}),
-        mobRates:mobRateMap(jobForBlob.runs),
-        mobMeta:mobMetaMap(jobForBlob.runs), /* v4.6.72e */
-        crew:JSON.stringify((jobForBlob.crew||[]).slice().sort())
-      });
-    }catch(stampErr){
-      logSaveFailure('stamp_refresh_error',job.id,(stampErr&&stampErr.message)||'unknown');
-    }
-    /* PATCH A — Snapshot system. Snapshots use the FULL job (including
-       tallies from React state) as a recovery option. Yesterday and
-       earlier snapshots remain frozen and intact. */
-    try{
-      const snapPayload={
-        contractor_slug:CONTRACTOR_SLUG,
-        job_id:job.id,
-        snapshot_date:localToday(),
-        data:job, /* full job — tallies included for recovery */
-        updated_at:new Date().toISOString()
-      };
-      withTimeout(
-        sb.from('job_snapshots').upsert(snapPayload,{onConflict:'contractor_slug,job_id,snapshot_date'}).then(r=>{
-          if(r&&r.error)logSaveFailure('snapshot_error',job.id,r.error.message);
-        }),
-        3000,
-        'snapshot_timeout'
-      ).catch(err=>{
-        logSaveFailure(err.message==='snapshot_timeout'?'snapshot_timeout':'snapshot_error',job.id,err.message);
-      });
-    }catch(snapErr){ /* never break the save flow */ }
-  }catch(e){
-    /* Queue for retry on next online event or mountLoad */
-    queueWrite('job',job.id,jobForBlob);
-    /* Log forensically — fire-and-forget, never throws */
-    logSaveFailure(
-      e.message==='upsert_timeout'?'timeout':'error',
-      job.id,
-      e.message
-    );
-  }
+  const tree=stampTreeFor(job);
+  if(!navigator.onLine){queueWrite('job',job.id,jobForBlob,tree);return;}
+  const res=await mergeAndWriteJob(job.id,jobForBlob,tree,'save');
+  if(!res||!res.ok){queueWrite('job',job.id,jobForBlob,tree);return;}
+  dequeue('job',job.id);
+  /* The stamp is built from what THIS DEVICE holds, not from what was written:
+     a field the server kept is still stale here until the next load, and must
+     keep losing to the server; a field written through equals the server. */
+  try{_srvStamp.set(job.id,{tree:buildStamp(jobForBlob)});}catch(stampErr){logSaveFailure('stamp_refresh_error',job.id,(stampErr&&stampErr.message)||'unknown');}
+  /* PATCH A — Snapshot system. Full job (tallies from React state) as a
+     recovery option. Yesterday and earlier snapshots remain frozen. */
+  if(res.wrote)writeJobSnapshot(job.id,job);
 }
 async function dbDeleteJob(jobId){
   const jobs=lsGet(LS_JOBS)||[];
