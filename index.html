@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73g';
+const APP_VERSION='v4.6.73h';
+/* v4.6.73h (27 Oct 2026): PUSH NOTIFICATIONS + APP-ICON BADGE for Team chat. A Team chat post now reaches every opted-in phone as a notification (free) and the home-screen icon carries the unread count. Opt in from the banner at the top of Team chat ('Turn on notifications'); iPhone needs myGang on the Home Screen first (iOS 16.4+) and the banner says so; 'Not now' hides it for a week. Device subscriptions live in push_subscriptions (endpoint, keys, crew id, last_seen_at); a database trigger on chat_messages (pg_net) asks the broker /api/push/notify to send to every device of the contractor except the sender's, badge = messages since that device last opened the chat; opening the chat clears the badge and tells the server. Tapping the notification opens Team chat (/#chat or a message to the open app). sw.js gains push / notificationclick / pushsubscriptionchange handlers. SMS pointer texts from Broadcast stay until a crew is opted in. No pay, tally, save-layer or Xero change. */
 /* v4.6.73g (27 Oct 2026): (1) BROADCAST AS A POINTER - the Twilio export (21 Apr-24 Oct) put broadcasts at US$321 of $627, Knights $250 of it, 57% of broadcasts over 2 segments, Knights' October broadcasts alone costing more than the subscription. Default mode now posts the full text to Team chat (free, 30 days) and sends each crew member a ONE-segment text to open the app; 'Full text by SMS' remains, capped at 2 segments (306 characters) with a live characters-left counter and the send button disabled past it; farm contacts always get the full text (they are not in Team chat); the cost of the chosen mode, and what the other would have cost, shown before Send; broadcast_sent/broadcast_failed events say which mode. (2) SAVE SERIALISER - one job save in flight per job per device, the newest waits and runs once (Knights 27 Oct 07:19: a start-of-day burst of saves of the same job conflicted with each other under the 72h conditional write and one exhausted its retries - nothing lost, queued and merged on the next flush); conflict retries 3->5 with jittered backoff. No pay or tally change. */
 /* v4.6.73f (25 Oct 2026): ONE WRITE ROUTINE FOR jobs.data (Knights 25 Oct, DB-proven: MCIN-0030 lost 7 crew, its start date and sheep count to a 5-day-old blob flushed RAW from the job queue - the flush path ran no guard and wrote no snapshot; PYLA-0035 lost 9 crew the same way, CLEA-0095 was un-charged-out three times; every refused shrink save since May was queued and later flushed raw). mergeAndWriteJob is now the only write path for direct saves, queue flushes and sync-on-open. (1) A device can only change what it changed: per field at every level - top-level fields, status, rates, each crew-details/override entry, each day/run/mob - the server's value is kept wherever this device still holds what it last saw and the server has moved on; a deliberate edit is written through. (2) Guards are mandatory: reads get 8s with one retry and if they cannot complete nothing is written - the blob is queued WITH its stamp and merged later. (3) Nothing is refused-then-queued; work is protected as a merge rule (a run with cells or a person with work is never dropped). (4) Writes are conditional on updated_at with re-merge on conflict. (5) A merge that changes nothing writes nothing. (6) Blobs queued by the previous build (no stamp) can only add, never remove or revert. Log reasons: merge_kept, merge_noop_kept, merge_unavailable_queued, merge_conflict_retry, guard_shrink_restored, guard_crew_restored, queue_item_expired. No pay, tally-cell, UI, SMS or Xero change. */
 /* v4.6.73e (21 Oct 2026): A QUEUE FLUSH CAN NEVER DROP A ROW (Baxters 20 Oct, DB-proven: three tally flushes overlapped on a signal blip at 2:32:04pm and a run's counts queued mid-flush were overwritten by a flush writing its stale leftovers back over the whole queue; same pattern in the job-blob and mob-metadata queues, which is also the likely cause of Hancock Redpath 17 Oct where 4 runs/411 head are in tally_entries but not the job). (1) JOURNAL FIRST - writeTallyCell puts the row in localStorage before any network call. (2) REMOVE BY IDENTITY - every flush removes only the exact row it landed (key + timestamp) from the live queue; never writes a list back. (3) SINGLE FLIGHT - one flush per queue at a time, late callers trigger one more pass. (4) NEWEST KEYSTROKE WINS - a new write for a cell aborts the older airborne one, and the DB trigger tally_entries_no_stale_overwrite refuses an older updated_at over a newer one (10-minute window, so a wrong phone clock cannot lock a device out). No pay, sync-order or settings change. */
@@ -8870,6 +8871,16 @@ function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule
   /* v4.6.10 - crew identity (read_only devices): visibility filter, not authentication */
   const [myId,setMyId]=useState(lsGet(LS_MY_ID)||null);
   const [showChat,setShowChat]=useState(false); /* v4.6.72d */
+  /* v4.6.72j - opened from a notification: the service worker focuses us and
+     posts mg-open-chat, or opens /#chat cold. */
+  useEffect(()=>{
+    const openIfHash=()=>{if(String(window.location.hash||'')==='#chat'){setShowChat(true);try{history.replaceState(null,'',window.location.pathname);}catch(e){}}};
+    openIfHash();
+    const onMsg=ev=>{if(ev&&ev.data&&ev.data.type==='mg-open-chat')setShowChat(true);if(ev&&ev.data&&ev.data.type==='mg-push-resub'){_pushSynced=false;pushSync(role);}};
+    try{if(navigator.serviceWorker)navigator.serviceWorker.addEventListener('message',onMsg);}catch(e){}
+    window.addEventListener('hashchange',openIfHash);
+    return()=>{try{if(navigator.serviceWorker)navigator.serviceWorker.removeEventListener('message',onMsg);}catch(e){}window.removeEventListener('hashchange',openIfHash);};
+  },[]);
   const [pinClaim,setPinClaim]=useState(null); /* v4.6.12 */
   const [pinErr,setPinErr]=useState('');
   const [crewSearch,setCrewSearch]=useState('');
@@ -9929,6 +9940,9 @@ function a2hsEnv(){
    Send needs a connection - a failed send stays in the box marked, no queue (chat
    is not tally data). Admin can delete any message. No push yet (phase 2). */
 const LS_CHAT_SEEN='mg_chat_seen_'+CONTRACTOR_SLUG;
+const LS_PUSH_ENDPOINT='mg_push_ep_'+CONTRACTOR_SLUG; /* v4.6.72j - this device's push endpoint once opted in */
+const LS_PUSH_DISMISSED='mg_push_dismissed_'+CONTRACTOR_SLUG;
+const PUSH_VAPID_PUBLIC='BLaVGElCp6Q35hW98M8x2_o_Ny8Cg0lE7oIQFVNivP3bHOi8k-PgW0AaKgwiG5QG0zGB05EKYDajnIU_HyjrWHA'; /* v4.6.72j - public half of the broker's VAPID key; the private half never leaves mygangxero */
 const CHAT_DAYS=30;
 function chatSinceIso(){return new Date(Date.now()-CHAT_DAYS*86400000).toISOString();}
 function chatIdentity(role){
@@ -9958,6 +9972,98 @@ function chatDayLabel(iso){
   if(same(d,t))return 'Today';if(same(d,y))return 'Yesterday';
   return d.toLocaleDateString('en-AU',{weekday:'short',day:'numeric',month:'short'});
 }
+/* ── v4.6.72j PUSH NOTIFICATIONS + APP-ICON BADGE (27 Oct 2026) ──
+   Why: broadcasts were costing more than the subscription (Twilio: US$321 in
+   broadcasts, Knights $250 of it) because a text is the only way a crew member
+   found out something was said. Now a Team chat post reaches every opted-in
+   phone as a notification, free, and the home-screen icon carries the unread
+   count. The SMS pointer stays until a contractor's crew are all opted in.
+   How: the device subscribes with the browser's push service (VAPID public
+   key above), the subscription is saved to push_subscriptions, and a database
+   trigger on chat_messages asks the broker to push to every device of that
+   contractor except the sender's. Badge = messages since this device last
+   opened the chat (push_subscriptions.last_seen_at). iPhone: only works once
+   myGang is on the Home Screen (iOS 16.4+) - the banner says so. */
+function pushEnv(){
+  const env=a2hsEnv();
+  const supported=('serviceWorker' in navigator)&&('PushManager' in window)&&('Notification' in window);
+  return {...env,supported};
+}
+function pushState(){
+  const env=pushEnv();
+  if(env.ios&&!env.standalone)return 'needs_homescreen';
+  if(!env.supported)return 'unsupported';
+  const p=Notification.permission;
+  if(p==='denied')return 'denied';
+  if(p==='granted'&&lsGet(LS_PUSH_ENDPOINT))return 'on';
+  return 'off';
+}
+function b64uToU8(s){const pad='='.repeat((4-s.length%4)%4);const b=atob((s+pad).replace(/-/g,'+').replace(/_/g,'/'));const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;}
+async function pushSaveSubscription(sub,role){
+  const me=chatIdentity(role)||{};const j=sub.toJSON?sub.toJSON():sub;
+  const row={endpoint:j.endpoint,contractor_slug:CONTRACTOR_SLUG,crew_id:me.crewId||null,role:me.role||role||null,name:me.name||null,
+    keys:j.keys,user_agent:(navigator.userAgent||'').slice(0,300),updated_at:new Date().toISOString()};
+  const r=await withTimeout(sb.from('push_subscriptions').upsert(row,{onConflict:'endpoint'}),12000,'push_save_timeout');
+  if(r&&r.error)throw new Error(r.error.message);
+  lsSet(LS_PUSH_ENDPOINT,j.endpoint);
+}
+async function enablePush(role){
+  const env=pushEnv();
+  if(env.ios&&!env.standalone)throw new Error('needs_homescreen');
+  if(!env.supported)throw new Error('unsupported');
+  const perm=await Notification.requestPermission();
+  if(perm!=='granted')throw new Error(perm==='denied'?'denied':'dismissed');
+  const reg=await navigator.serviceWorker.ready;
+  let sub=await reg.pushManager.getSubscription();
+  if(!sub)sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64uToU8(PUSH_VAPID_PUBLIC)});
+  await pushSaveSubscription(sub,role);
+  return true;
+}
+/* once per boot, on the home board: if this device opted in earlier, keep its row current
+   (endpoints rotate, the bound name changes). Never prompts. */
+let _pushSynced=false;
+async function pushSync(role){
+  if(_pushSynced)return;_pushSynced=true;
+  try{
+    const env=pushEnv();if(!env.supported||Notification.permission!=='granted')return;
+    const reg=await navigator.serviceWorker.ready;const sub=await reg.pushManager.getSubscription();
+    if(sub)await pushSaveSubscription(sub,role);else lsRemove(LS_PUSH_ENDPOINT);
+  }catch(e){}
+}
+let _pushSeenAt=0;
+async function pushMarkSeen(){
+  try{
+    const ep=lsGet(LS_PUSH_ENDPOINT);if(!ep)return;
+    if(Date.now()-_pushSeenAt<60000)return;_pushSeenAt=Date.now();
+    await withTimeout(sb.from('push_subscriptions').update({last_seen_at:new Date().toISOString()}).eq('endpoint',ep),8000,'push_seen_timeout');
+  }catch(e){}
+}
+function appBadge(n){try{if(!('setAppBadge' in navigator))return;if(n>0)navigator.setAppBadge(n).catch(()=>{});else navigator.clearAppBadge().catch(()=>{});}catch(e){}}
+/* banner at the top of the Team chat sheet */
+function PushBanner({role}){
+  const [st,setSt]=useState(pushState());
+  const [busy,setBusy]=useState(false);
+  const [note,setNote]=useState('');
+  const dismissed=(()=>{const d=lsGet(LS_PUSH_DISMISSED);return d&&(Date.now()-Number(d))<7*86400000;})();
+  if(st==='on'||st==='unsupported'||(st==='off'&&dismissed))return null;
+  const box={margin:'8px 12px 0',padding:'10px 12px',borderRadius:10,fontSize:13,lineHeight:1.45,background:'var(--amberD)',border:'1px solid var(--amberB)',color:'var(--text)',flexShrink:0};
+  const btn={background:'var(--amber)',color:'#1e2a3a',border:0,borderRadius:8,padding:'8px 12px',fontWeight:800,fontSize:13,cursor:'pointer'};
+  const dim={background:'none',border:0,color:'var(--muted)',fontSize:12,cursor:'pointer',padding:'8px 6px'};
+  if(st==='needs_homescreen')return e('div',{style:box},e('b',null,'🔔 Notifications need myGang on your Home Screen. '),'Tap Share → Add to Home Screen, open it from there, then come back to Team chat.');
+  if(st==='denied')return e('div',{style:box},e('b',null,'🔔 Notifications are blocked for myGang '),'in your phone settings. Turn them on there to get a buzz when someone posts.');
+  const go=async()=>{
+    setBusy(true);setNote('');
+    try{await enablePush(role);setSt('on');}
+    catch(e2){const m=(e2&&e2.message)||'';setSt(pushState());setNote(m==='denied'?'Blocked in your phone settings.':m==='dismissed'?'No worries - you can turn it on later.':'Could not turn on notifications - check signal and try again.');}
+    finally{setBusy(false);}
+  };
+  return e('div',{style:box},
+    e('div',{style:{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}},
+      e('div',{style:{flex:'1 1 180px'}},e('b',null,'🔔 Get a buzz when someone posts'),e('div',{style:{fontSize:12,color:'var(--muted)'}},'Free. No more texts for shed talk.')),
+      e('button',{style:btn,disabled:busy,onClick:go},busy?'Turning on…':'Turn on notifications'),
+      e('button',{style:dim,onClick:()=>{lsSet(LS_PUSH_DISMISSED,String(Date.now()));setSt('dismissed');}},'Not now')),
+    note?e('div',{style:{marginTop:6,fontSize:12,color:'var(--muted)'}},note):null);
+}
 /* Home-board bar: unread count, opens the sheet. Polls every 60s while on the board. */
 function TeamChatBar({role,onOpen}){
   const me=chatIdentity(role);
@@ -9965,8 +10071,9 @@ function TeamChatBar({role,onOpen}){
   const [last,setLast]=useState(null);
   useEffect(()=>{
     let dead=false;
-    const tick=async()=>{try{const m=await chatLoad();if(dead)return;setUnread(chatUnreadCount(m,me));setLast(m.length?m[m.length-1]:null);}catch(e){}};
+    const tick=async()=>{try{const m=await chatLoad();if(dead)return;const n=chatUnreadCount(m,me);setUnread(n);appBadge(n);setLast(m.length?m[m.length-1]:null);}catch(e){}};
     tick();const t=setInterval(tick,60000);
+    pushSync(role); /* v4.6.72j */
     return()=>{dead=true;clearInterval(t);};
   },[role]);
   return e('button',{onClick:onOpen,style:{display:'flex',alignItems:'center',gap:10,width:'calc(100% - 32px)',margin:'10px 16px 0',padding:'10px 12px',
@@ -9988,7 +10095,7 @@ function TeamChat({role,onClose}){
   const [pending,setPending]=useState({});     /* id -> 'sending'|'failed' */
   const listRef=useRef(null);
   const lastIso=useRef(null);
-  const markSeen=()=>{try{lsSet(LS_CHAT_SEEN,new Date().toISOString());}catch(e){}};
+  const markSeen=()=>{try{lsSet(LS_CHAT_SEEN,new Date().toISOString());}catch(e){}appBadge(0);pushMarkSeen();}; /* v4.6.72j - badge off, server told */
   const merge=rows=>setMsgs(prev=>{
     const m=new Map((prev||[]).map(x=>[x.id,x]));
     rows.forEach(r=>{m.set(r.id,r);if(!lastIso.current||r.created_at>lastIso.current)lastIso.current=r.created_at;});
@@ -10063,6 +10170,7 @@ function TeamChat({role,onClose}){
         e('div',{style:{fontSize:11,opacity:.75}},'Messages disappear after '+CHAT_DAYS+' days'+(role==='admin'?' \u00b7 tap a message to delete it':''))),
       e('span',{style:{fontSize:22}},'\uD83D\uDCAC')),
     err&&e('div',{style:{padding:'8px 16px',fontSize:12,background:'var(--redD)',color:'var(--red)',flexShrink:0}},err),
+    e(PushBanner,{role}), /* v4.6.72j */
     e('div',{ref:listRef,style:{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch',padding:'4px 12px 12px'}},
       msgs===null?e('div',{style:{textAlign:'center',color:'var(--muted)',padding:40}},'Loading\u2026')
       :items.length?items
