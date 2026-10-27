@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73h';
+const APP_VERSION='v4.6.73i';
+/* v4.6.73i (28 Oct 2026): SMS METER. Every text now carries the contractor slug to /api/send-sms, which writes one sms_usage row per batch with Twilio's own segment count (kind: broadcast / pointer / job_card / farmer / pin). Admin home board shows 'SMS this month: N texts, N segments, ~A$X' at the rate in billing_config (A$0.10 a segment; subscription stays flat, nothing included). Dale's monthly report is the view sms_usage_monthly. Also unifies api/send-sms.js across the fleet (AU number normalisation, dual env names, clear config errors). No pay, tally, save-layer or Xero change. */
 /* v4.6.73h (27 Oct 2026): PUSH NOTIFICATIONS + APP-ICON BADGE for Team chat. A Team chat post now reaches every opted-in phone as a notification (free) and the home-screen icon carries the unread count. Opt in from the banner at the top of Team chat ('Turn on notifications'); iPhone needs myGang on the Home Screen first (iOS 16.4+) and the banner says so; 'Not now' hides it for a week. Device subscriptions live in push_subscriptions (endpoint, keys, crew id, last_seen_at); a database trigger on chat_messages (pg_net) asks the broker /api/push/notify to send to every device of the contractor except the sender's, badge = messages since that device last opened the chat; opening the chat clears the badge and tells the server. Tapping the notification opens Team chat (/#chat or a message to the open app). sw.js gains push / notificationclick / pushsubscriptionchange handlers. SMS pointer texts from Broadcast stay until a crew is opted in. No pay, tally, save-layer or Xero change. */
 /* v4.6.73g (27 Oct 2026): (1) BROADCAST AS A POINTER - the Twilio export (21 Apr-24 Oct) put broadcasts at US$321 of $627, Knights $250 of it, 57% of broadcasts over 2 segments, Knights' October broadcasts alone costing more than the subscription. Default mode now posts the full text to Team chat (free, 30 days) and sends each crew member a ONE-segment text to open the app; 'Full text by SMS' remains, capped at 2 segments (306 characters) with a live characters-left counter and the send button disabled past it; farm contacts always get the full text (they are not in Team chat); the cost of the chosen mode, and what the other would have cost, shown before Send; broadcast_sent/broadcast_failed events say which mode. (2) SAVE SERIALISER - one job save in flight per job per device, the newest waits and runs once (Knights 27 Oct 07:19: a start-of-day burst of saves of the same job conflicted with each other under the 72h conditional write and one exhausted its retries - nothing lost, queued and merged on the next flush); conflict retries 3->5 with jittered backoff. No pay or tally change. */
 /* v4.6.73f (25 Oct 2026): ONE WRITE ROUTINE FOR jobs.data (Knights 25 Oct, DB-proven: MCIN-0030 lost 7 crew, its start date and sheep count to a 5-day-old blob flushed RAW from the job queue - the flush path ran no guard and wrote no snapshot; PYLA-0035 lost 9 crew the same way, CLEA-0095 was un-charged-out three times; every refused shrink save since May was queued and later flushed raw). mergeAndWriteJob is now the only write path for direct saves, queue flushes and sync-on-open. (1) A device can only change what it changed: per field at every level - top-level fields, status, rates, each crew-details/override entry, each day/run/mob - the server's value is kept wherever this device still holds what it last saw and the server has moved on; a deliberate edit is written through. (2) Guards are mandatory: reads get 8s with one retry and if they cannot complete nothing is written - the blob is queued WITH its stamp and merged later. (3) Nothing is refused-then-queued; work is protected as a merge rule (a run with cells or a person with work is never dropped). (4) Writes are conditional on updated_at with re-merge on conflict. (5) A merge that changes nothing writes nothing. (6) Blobs queued by the previous build (no stamp) can only add, never remove or revert. Log reasons: merge_kept, merge_noop_kept, merge_unavailable_queued, merge_conflict_retry, guard_shrink_restored, guard_crew_restored, queue_item_expired. No pay, tally-cell, UI, SMS or Xero change. */
@@ -4247,7 +4248,7 @@ function CrewPinRow({c,onSave}){
     if(!c.phone||!c.pin)return;
     setSmsState('sending');
     try{
-      const r=await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json'},
+      const r=await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json','x-mygang-slug':CONTRACTOR_SLUG},
         body:JSON.stringify({messages:[{to:c.phone,body:'Your myGang PIN for '+CONTRACTOR_NAME+' is '+c.pin+'. You need it when picking your name in the app. Keep this message.'}]})});
       setSmsState(r.ok?'sent':'failed');
     }catch(e2){setSmsState('failed');}
@@ -7535,7 +7536,7 @@ function BroadcastModal({job,onClose,farmList,crewList,role}){
     const messages=crewWithPhone.map(id=>{const c=gcl(id);return{to:c.phone,body};});
     if(alsoFarmer)fContacts.forEach(fc=>messages.push({to:fc.phone,body}));
     try{
-      const res=await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages})});
+      const res=await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json','x-mygang-slug':CONTRACTOR_SLUG},body:JSON.stringify({messages})});
       const data=await res.json();
       setSentCount(data.sent||0);
       setStatus(data.failed>0?'partial':'done');
@@ -7576,7 +7577,7 @@ function BroadcastModal({job,onClose,farmList,crewList,role}){
     const messages=crewWithPhone.map(id=>{const c=gcl(id);return{to:c.phone,body:_bodies.ptr};});
     if(alsoFarmer)fContacts.forEach(fc=>messages.push({to:fc.phone,body:_bodies.full}));
     try{
-      const res=await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages})});
+      const res=await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json','x-mygang-slug':CONTRACTOR_SLUG},body:JSON.stringify({messages})});
       const data=await res.json();
       setSentCount(data.sent||0);
       setStatus(data.failed>0?'partial':'done');
@@ -7773,7 +7774,7 @@ function CrewSMSRow({id,c,views,status,onPreview,job,farmList,crewList,appUrl}){
     try{
       /* v4.6.58 — build once, send it, and log exactly what was sent. */
       const cardBody=buildJobCardSMS(job,id,farmList,crewList,appUrl);
-      await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json'},
+      await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json','x-mygang-slug':CONTRACTOR_SLUG},
         body:JSON.stringify({messages:[{to:c.phone,body:cardBody}]})});
       logJobEvent(job&&job.id,'job_card_sent','To '+(c.name||id)+'\n'+cardBody);
       setIndivSent(true);
@@ -7826,7 +7827,7 @@ function FarmerSMSRow({job,views,onPreview,farmList,appUrl,farmerName,farmerPhon
       const list=contacts.length?contacts:[{name:farmerName||'there',phone:farmerPhone}];
       const messages=list.map(fc=>({to:fc.phone,
         body:buildFarmerSMS(job,fc.name||'there',fc.phone,farmList,appUrl)}));
-      await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json'},
+      await fetch('/api/send-sms',{method:'POST',headers:{'Content-Type':'application/json','x-mygang-slug':CONTRACTOR_SLUG},
         body:JSON.stringify({messages})});
       /* v4.6.58 — recorded verbatim. */
       logJobEvent(job&&job.id,'farmer_sms_sent',
@@ -7903,7 +7904,7 @@ function SMSModal({job,onClose,onPreview,farmList,crewList}){
     try{
       const res=await fetch('/api/send-sms',{
         method:'POST',
-        headers:{'Content-Type':'application/json'},
+        headers:{'Content-Type':'application/json','x-mygang-slug':CONTRACTOR_SLUG},
         body:JSON.stringify({messages}),
       });
       const data=await res.json();
@@ -8958,6 +8959,7 @@ function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule
     e(TopBar,{role,setRole,onSchedule}),
     e(PayDayNudge,{jobs:allJobs,role}), /* v4.6.72c - under the header, above the stats card */
     role!=='farmer'&&e(TeamChatBar,{key:'chatbar-'+(myId||''),role,onOpen:()=>setShowChat(true)}), /* v4.6.72d */
+    e(SmsMeterLine,{role}), /* v4.6.72k */
     showChat&&role!=='farmer'&&e(TeamChat,{role,onClose:()=>setShowChat(false)}),
     /* v4.6.11 - FARMER VIEW: farmer devices see only their farm's jobs */
     role==='farmer'&&e('div',{style:{position:'fixed',top:58,left:0,right:0,bottom:0,background:'var(--bg)',zIndex:150,overflowY:'auto',WebkitOverflowScrolling:'touch',padding:'16px'}},
@@ -10202,6 +10204,38 @@ function resolvePayDay(jobs){
   const pd=dflt.payDayOfWeek!=null?dflt.payDayOfWeek:(src.payDayOfWeek!=null?src.payDayOfWeek:5);
   const fq=dflt.payFrequency||src.payFrequency||'weekly';
   return {pd,fq};
+}
+/* ── v4.6.72k SMS METER (28 Oct 2026) ──
+   Dale's call: subscription stays flat, SMS is metered on top at A$0.10 a
+   segment, nothing included. Every /api/send-sms call now carries the slug;
+   the function writes one sms_usage row per batch with Twilio's own segment
+   count. This line on the admin home board shows the month so far; the rate
+   comes from billing_config so it can change without a deploy. */
+const SMS_BILL_AUD_PER_SEGMENT_DEFAULT=0.10;
+function SmsMeterLine({role}){
+  const [m,setM]=useState(null);
+  useEffect(()=>{
+    if(role!=='admin')return;
+    let dead=false;
+    (async()=>{
+      try{
+        const now=new Date();const start=new Date(now.getFullYear(),now.getMonth(),1).toISOString();
+        const [u,c]=await Promise.all([
+          withTimeout(sb.from('sms_usage').select('segments,sent,kind').eq('contractor_slug',CONTRACTOR_SLUG).gte('sent_at',start).limit(5000),8000,'sms_usage_timeout'),
+          withTimeout(sb.from('billing_config').select('v').eq('k','sms_aud_per_segment').maybeSingle(),8000,'billing_cfg_timeout').catch(()=>null)
+        ]);
+        if(dead||!u||u.error)return;
+        const rows=u.data||[];const segs=rows.reduce((a,r)=>a+(Number(r.segments)||0),0);const texts=rows.reduce((a,r)=>a+(Number(r.sent)||0),0);
+        const rate=(c&&c.data&&Number(c.data.v)>0)?Number(c.data.v):SMS_BILL_AUD_PER_SEGMENT_DEFAULT;
+        setM({segs,texts,rate});
+      }catch(e){}
+    })();
+    return()=>{dead=true;};
+  },[role]);
+  if(role!=='admin'||!m)return null;
+  return e('div',{style:{margin:'8px 16px 0',fontSize:12,color:'var(--muted)',display:'flex',justifyContent:'space-between',alignItems:'center'}},
+    e('span',null,'📨 SMS this month: '+m.texts+' text'+(m.texts===1?'':'s')+' · '+m.segs+' segment'+(m.segs===1?'':'s')),
+    e('b',{style:{color:'var(--text)'}},'~A$'+(m.segs*m.rate).toFixed(2)));
 }
 function PayDayNudge({jobs,role}){
   const [dismissedFor,setDismissedFor]=useState(()=>lsGet(LS_PAYDAY_DISMISSED)||'');
