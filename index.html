@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73k';
+const APP_VERSION='v4.6.73l';
+/* v4.6.73l (29 Oct 2026): TEAM CHAT IN CREW VIEW. A VIEW-mode phone shows the crew overlay (G'day / My jobs / My tallies) on top of the home screen, and the Team chat bar sat underneath it - crew could not open the chat that the pointer broadcast sent them to (Woolaway, 29 Oct: contractor had to resend full text). The bar now sits under the greeting in the crew view. No other change. */
 /* v4.6.73k (28 Oct 2026): SAVE AUDIT FIXES. (1) Day notes no longer double: the note was treated as someone else's whenever updated_at strings differed, and the app's '...Z' never equalled PostgREST's '...+00:00', so any edit inside saved text prepended the whole saved note (Knights MARG-0028: 3 lines became 29). Identity is now the body this device last saw; genuine concurrent edits merge line-wise with no loss; one write per date at a time. (2) Broadcasts, pointers and job cards go once per phone number - a worker held as two or three crew records got every text two or three times. (3) Version watch: the app checks /version.json on resume and every 20 min; a different build reloads itself once from the home screen when idle, otherwise shows an 'Update ready' pill. A Knights iPhone ran a 2.5-day-old build through three fixes without it. sw.js v13 never caches version.json. (4) A whiteboard note that landed but timed out is no longer retried forever. No pay-engine, tally or job-blob change. */
 /* v4.6.73j (28 Oct 2026): EDIT JOB ROLES ARE HONEST (CJ TALL-0066: Jamie Morton's record said Penner, the job's own role snapshot said Shearer; Edit Job grouped him under Penners from the record but never rewrote the snapshot, even after removing and re-adding him three times, so the Tally tab kept him on a stand). Edit Job now groups people by the role the JOB uses, lists anyone whose record role differs ('on this job as Shearer - record says Penner') with an Update button, logs crew_role_changed when applied, and gives a person who is removed and later re-added their current record role. Finished jobs are untouched. No pay-engine, save-layer or sync change. */
 /* v4.6.73i (28 Oct 2026): SMS METER. Every text now carries the contractor slug to /api/send-sms, which writes one sms_usage row per batch with Twilio's own segment count (kind: broadcast / pointer / job_card / farmer / pin). Admin home board shows 'SMS this month: N texts, N segments, ~A$X' at the rate in billing_config (A$0.10 a segment; subscription stays flat, nothing included). Dale's monthly report is the view sms_usage_monthly. Also unifies api/send-sms.js across the fleet (AU number normalisation, dual env names, clear config errors). No pay, tally, save-layer or Xero change. */
@@ -9124,7 +9125,7 @@ function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule
   return e('div',null,
     e(TopBar,{role,setRole,onSchedule}),
     e(PayDayNudge,{jobs:allJobs,role}), /* v4.6.72c - under the header, above the stats card */
-    role!=='farmer'&&e(TeamChatBar,{key:'chatbar-'+(myId||''),role,onOpen:()=>setShowChat(true)}), /* v4.6.72d */
+    role!=='farmer'&&!(role==='read_only'&&((lsGet(LS_APP_SETTINGS)||{}).crewView!=='all'))&&e(TeamChatBar,{key:'chatbar-'+(myId||''),role,onOpen:()=>setShowChat(true)}), /* v4.6.72d; v4.6.72n - the crew view carries its own bar */
     e(SmsMeterLine,{role}), /* v4.6.72k */
     showChat&&role!=='farmer'&&e(TeamChat,{role,onClose:()=>setShowChat(false)}),
     /* v4.6.11 - FARMER VIEW: farmer devices see only their farm's jobs */
@@ -9185,6 +9186,9 @@ function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule
           e('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',margin:'6px 0 2px'}},
             e('div',{style:{fontFamily:'var(--h)',fontSize:20,fontWeight:800}},"G'day "+((me&&me.name.split(' ')[0])||'')),
             e('button',{onClick:()=>{lsSet(LS_MY_ID,'');setMyId(null);},style:{background:'none',border:'none',color:'var(--muted)',fontSize:12,cursor:'pointer',textDecoration:'underline'}},'Not you?')),
+          /* v4.6.72n - the Team chat bar was under this overlay, so VIEW-mode crew could not
+             open the chat the pointer text sent them to (Woolaway, 29 Oct). */
+          e('div',{style:{margin:'0 -16px 2px'}},e(TeamChatBar,{key:'chatbar-crew-'+myId,role,onOpen:()=>setShowChat(true)})),
           e('div',{style:{display:'flex',gap:8,margin:'10px 0 14px'}},
             ['jobs','tallies'].map(t=>e('button',{key:t,onClick:()=>setCrewTab(t),
               style:{flex:1,background:crewTab===t?'var(--amber)':'var(--card)',color:crewTab===t?'#000':'var(--muted)',
