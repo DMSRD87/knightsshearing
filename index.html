@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73n';
+const APP_VERSION='v4.6.73o';
+/* v4.6.73o (12 Nov 2026): SHED RUNS TO XERO BY ROLE. Shelley (Knights): classers and pressers came across as 'Shedhand HR'. Every run went out as one component. Lines now carry the role they were paid under; the Xero payload sends classer runs as classer_runs and presser runs as presser_runs, wool handlers and penners stay shed_runs; two new rows in My Database > Xero > Pay items. The broker uses the Shed staff runs item for either until it is mapped. Pay engine untouched. */
 /* v4.6.73n (12 Nov 2026): PAYG TO XERO. Teegan (Knights, 5 Nov): every payslip needed a manual tax adjustment because shearers are withheld at a flat rate. The push now sends each worker's myGang tax (sum of per-job Tax Withholding % slices, as the Pay Week report) and the %; the broker reads Xero's own PAYG and posts the difference as a manual adjustment, proven on Demo Company 12 Nov (probe Q4-Q7, pushtest). No % = Xero's tables, untouched. Dry run shows the PAYG column; result flags any payslip whose tax missed. Pay engine unchanged. */
 /* v4.6.73m (30 Oct 2026): BROADCAST CAP IS A WARNING, NOT A LIMIT. Josh (Knights): 'I'm not concerned with the $2, I'd prefer the clear received message.' SMS is metered to the contractor, so the 2-text cap only ever protected their own money. Full-text mode still shows segments x people and the dollar figure before Send and flags a long message; it no longer refuses. The sheet remembers the last mode used on this phone. No other change. */
 /* v4.6.73l (29 Oct 2026): TEAM CHAT IN CREW VIEW. A VIEW-mode phone shows the crew overlay (G'day / My jobs / My tallies) on top of the home screen, and the Team chat bar sat underneath it - crew could not open the chat that the pointer broadcast sent them to (Woolaway, 29 Oct: contractor had to resend full text). The bar now sits under the greeting in the crew view. No other change. */
@@ -3787,12 +3788,12 @@ function payWeekJobData(job,period){
           const cd=classerDayEarn(job,id,date,units,rr);
           w.staffEarn+=cd.earn;
           w.lines.push({date,shed,item:cd.basis==='fleeces'?(cd.units.toLocaleString()+' fleeces classed'):(units+' run'+(units===1?'':'s')+' '+r),
-            units:cd.units,rate:cd.rate,amount:cd.earn,superable:true,kind:cd.basis==='fleeces'?'classer_fleece':'shed_runs'});
+            units:cd.units,rate:cd.rate,amount:cd.earn,superable:true,kind:cd.basis==='fleeces'?'classer_fleece':'shed_runs',role:r});
           return;
         }
         const earn=units*rr;
         w.staffEarn+=earn;
-        w.lines.push({date,shed,item:units+' run'+(units===1?'':'s')+' '+r,units,rate:rr,amount:earn,superable:true,kind:'shed_runs'});
+        w.lines.push({date,shed,item:units+' run'+(units===1?'':'s')+' '+r,units,rate:rr,amount:earn,superable:true,kind:'shed_runs',role:r});
       });
     });
     const skipD=dt=>splitD.indexOf(dt)>=0;
@@ -3811,7 +3812,7 @@ function payWeekJobData(job,period){
           if(bales>thr){const pb=rates.presserPerBale||14.20;const earn=bales*pb;const w=W(id);w.staffEarn+=earn;
             w.lines.push({date,shed,item:bales+' bales',units:bales,rate:pb,amount:earn,superable:true,kind:'bales'});}
           else if(runs>0){const earn=runs*rpr;const w=W(id);w.staffEarn+=earn;
-            w.lines.push({date,shed,item:runs+' runs',units:runs,rate:rpr,amount:earn,superable:true,kind:'shed_runs'});}
+            w.lines.push({date,shed,item:runs+' runs',units:runs,rate:rpr,amount:earn,superable:true,kind:'shed_runs',role:'Presser'});}
         }
       });
     }else{
@@ -3823,11 +3824,11 @@ function payWeekJobData(job,period){
           const cd=classerDayEarn(job,id,date,runs,rpr);
           w.staffEarn+=cd.earn;
           w.lines.push({date,shed,item:cd.basis==='fleeces'?(cd.units.toLocaleString()+' fleeces classed'):(runs+' runs'),
-            units:cd.units,rate:cd.rate,amount:cd.earn,superable:true,kind:cd.basis==='fleeces'?'classer_fleece':'shed_runs'});
+            units:cd.units,rate:cd.rate,amount:cd.earn,superable:true,kind:cd.basis==='fleeces'?'classer_fleece':'shed_runs',role});
           return;
         }
         const earn=runs*rpr;w.staffEarn+=earn;
-        w.lines.push({date,shed,item:runs+' runs',units:runs,rate:rpr,amount:earn,superable:true,kind:'shed_runs'});
+        w.lines.push({date,shed,item:runs+' runs',units:runs,rate:rpr,amount:earn,superable:true,kind:'shed_runs',role});
       });
     }
   });
@@ -4023,7 +4024,7 @@ function isActiveCrew(c){return !!c&&c.active!==false;}
    nothing else; the report and CSV are byte-identical. */
 const XERO_BROKER='https://mygangxero.vercel.app';
 const XERO_COMPONENTS=[
-  ['shearing','Shearing (per head)'],['crutching','Crutching (per head)'],['shed_runs','Shed staff runs'],
+  ['shearing','Shearing (per head)'],['crutching','Crutching (per head)'],['shed_runs','Shed staff runs (wool handlers, penners)'],['classer_runs','Classer runs'],['presser_runs','Presser runs'],
   ['classer_fleece','Wool classing (per fleece)'],['bales','Pressing (per bale)'],['bale_kg','Pressing (per kg)'],['cook_day','Cook (per day)'],['cook_head','Cook (per head)'],
   ['team_loading','Team loading'],['stand_fee','Stand fee (BYO)'],['travel','Travel'],['mess','Mess'],['sundries','Sundries']];
 const XERO_COMP_LABEL=XERO_COMPONENTS.reduce((a,x)=>{a[x[0]]=x[1];return a;},{});
@@ -4059,6 +4060,15 @@ async function xeroFetch(path,opts){
 /* crew id → the id the person is paid under (aliasOf chain, one hop, guarded) */
 function xeroPrimaryId(id){const c=gc(id);if(c&&c.aliasOf&&c.aliasOf!==id&&gc(c.aliasOf))return c.aliasOf;return id;}
 /* Pay Week → push contract. Same data the report prints, grouped per person. */
+/* v4.6.73o - shed runs go to Xero under the role they were paid as (Shelley, Knights 12 Nov:
+   classers and pressers were landing as 'Shedhand HR'). Wool handlers and penners stay shed_runs. */
+function xeroComponentFor(ln,w){
+  if(ln.kind!=='shed_runs')return ln.kind;
+  const r=ln.role||w.role||'';
+  if(r==='Wool Classer')return 'classer_runs';
+  if(r==='Presser')return 'presser_runs';
+  return 'shed_runs';
+}
 function buildXeroPayload(jobs,period,fq){
   const per={};
   (jobs||[]).forEach(job=>{
@@ -4068,7 +4078,7 @@ function buildXeroPayload(jobs,period,fq){
       const pid=xeroPrimaryId(w.id);const c=gc(pid)||{};
       if(!per[pid])per[pid]={crewId:pid,name:c.name||w.name,role:c.role||w.role,employmentType:c.employmentType||'employee',lines:[],gross:0,tax:0,_pcts:[]};
       const p=per[pid];
-      w.lines.forEach(ln=>{if(!ln.kind)return;p.lines.push({component:ln.kind,units:ln.units,rate:ln.rate,amount:ln.amount,desc:((ln.date?ln.date+' ':'')+ln.shed+' '+ln.item).slice(0,50)});});
+      w.lines.forEach(ln=>{if(!ln.kind)return;p.lines.push({component:xeroComponentFor(ln,w),units:ln.units,rate:ln.rate,amount:ln.amount,desc:((ln.date?ln.date+' ':'')+ln.shed+' '+ln.item).slice(0,50)});});
       if(w.mess>0)p.lines.push({component:'mess',units:1,rate:w.mess,amount:w.mess,desc:'Mess'});
       if(w.sundries>0)p.lines.push({component:'sundries',units:1,rate:w.sundries,amount:w.sundries,desc:'Sundries'});
       p.gross+=(w.piece+w.teamLoad+w.staffEarn+w.stand);
