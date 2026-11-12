@@ -624,7 +624,8 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73m';
+const APP_VERSION='v4.6.73n';
+/* v4.6.73n (12 Nov 2026): PAYG TO XERO. Teegan (Knights, 5 Nov): every payslip needed a manual tax adjustment because shearers are withheld at a flat rate. The push now sends each worker's myGang tax (sum of per-job Tax Withholding % slices, as the Pay Week report) and the %; the broker reads Xero's own PAYG and posts the difference as a manual adjustment, proven on Demo Company 12 Nov (probe Q4-Q7, pushtest). No % = Xero's tables, untouched. Dry run shows the PAYG column; result flags any payslip whose tax missed. Pay engine unchanged. */
 /* v4.6.73m (30 Oct 2026): BROADCAST CAP IS A WARNING, NOT A LIMIT. Josh (Knights): 'I'm not concerned with the $2, I'd prefer the clear received message.' SMS is metered to the contractor, so the 2-text cap only ever protected their own money. Full-text mode still shows segments x people and the dollar figure before Send and flags a long message; it no longer refuses. The sheet remembers the last mode used on this phone. No other change. */
 /* v4.6.73l (29 Oct 2026): TEAM CHAT IN CREW VIEW. A VIEW-mode phone shows the crew overlay (G'day / My jobs / My tallies) on top of the home screen, and the Team chat bar sat underneath it - crew could not open the chat that the pointer broadcast sent them to (Woolaway, 29 Oct: contractor had to resend full text). The bar now sits under the greeting in the crew view. No other change. */
 /* v4.6.73k (28 Oct 2026): SAVE AUDIT FIXES. (1) Day notes no longer double: the note was treated as someone else's whenever updated_at strings differed, and the app's '...Z' never equalled PostgREST's '...+00:00', so any edit inside saved text prepended the whole saved note (Knights MARG-0028: 3 lines became 29). Identity is now the body this device last saw; genuine concurrent edits merge line-wise with no loss; one write per date at a time. (2) Broadcasts, pointers and job cards go once per phone number - a worker held as two or three crew records got every text two or three times. (3) Version watch: the app checks /version.json on resume and every 20 min; a different build reloads itself once from the home screen when idle, otherwise shows an 'Update ready' pill. A Knights iPhone ran a 2.5-day-old build through three fixes without it. sw.js v13 never caches version.json. (4) A whiteboard note that landed but timed out is no longer retried forever. No pay-engine, tally or job-blob change. */
@@ -4065,17 +4066,24 @@ function buildXeroPayload(jobs,period,fq){
     const data=payWeekJobData(job,period);
     Object.values(data).forEach(w=>{
       const pid=xeroPrimaryId(w.id);const c=gc(pid)||{};
-      if(!per[pid])per[pid]={crewId:pid,name:c.name||w.name,role:c.role||w.role,employmentType:c.employmentType||'employee',lines:[],gross:0};
+      if(!per[pid])per[pid]={crewId:pid,name:c.name||w.name,role:c.role||w.role,employmentType:c.employmentType||'employee',lines:[],gross:0,tax:0,_pcts:[]};
       const p=per[pid];
       w.lines.forEach(ln=>{if(!ln.kind)return;p.lines.push({component:ln.kind,units:ln.units,rate:ln.rate,amount:ln.amount,desc:((ln.date?ln.date+' ':'')+ln.shed+' '+ln.item).slice(0,50)});});
       if(w.mess>0)p.lines.push({component:'mess',units:1,rate:w.mess,amount:w.mess,desc:'Mess'});
       if(w.sundries>0)p.lines.push({component:'sundries',units:1,rate:w.sundries,amount:w.sundries,desc:'Sundries'});
       p.gross+=(w.piece+w.teamLoad+w.staffEarn+w.stand);
+      /* v4.6.73n - PAYG: the same per-job Tax Withholding % slices the Pay Week report prints */
+      p.tax+=(Number(w.tax)||0);
+      {const _pc=parseFloat(((((job.rates||{}).crewDetails||{})[w.id])||{}).taxRate||0)||0;if(_pc>0&&p._pcts.indexOf(_pc)<0)p._pcts.push(_pc);}
     });
   });
   const workers=[],skipped=[];
   Object.values(per).sort((a,b)=>a.name.localeCompare(b.name)).forEach(p=>{
     p.gross=Math.round(p.gross*100)/100;
+    p.tax=Math.round(p.tax*100)/100;
+    /* taxPct present = this worker has a myGang % and the broker sets Xero's PAYG to p.tax; absent = Xero's tables */
+    if(p._pcts.length){p.taxPct=p._pcts.length===1?p._pcts[0]:Math.max.apply(null,p._pcts);if(p._pcts.length>1)p.taxMixed=p._pcts.slice().sort((a,b)=>a-b).join('/');}
+    delete p._pcts;
     if(!p.lines.length)return;
     if(p.employmentType==='contractor'){skipped.push({name:p.name,why:'ABN contractor — not paid through Xero payroll'});return;}
     workers.push(p);
@@ -4253,7 +4261,7 @@ function XeroPushModal({jobs,period,fq,onClose}){
   const doPush=async()=>{
     setPhase('pushing');setErr('');
     try{
-      const r=await xeroFetch('/api/xero/push',{body:payload,timeoutMs:60000});
+      const r=await xeroFetch('/api/xero/push',{body:payload,timeoutMs:170000}); /* v4.6.73n - two-phase push (PAYG) is ~2 Xero calls per worker; broker allows 180s */
       setRes(r);
       if(r.stage==='pushed')setPhase('done');else{setDry(r);setPhase(r.errors?'blocked':'error');if(r.error)setErr(r.error);}
     }catch(e2){setErr(e2.message);setPhase('error');}
@@ -4276,10 +4284,12 @@ function XeroPushModal({jobs,period,fq,onClose}){
     e('div',{style:{fontSize:12.5,lineHeight:1.45}},err||'Unknown error'),
     res&&res.payRunId&&e('div',{style:{fontSize:11.5,color:'var(--dim)',marginTop:8}},'A draft may exist in Xero — check Payroll → Pay employees.'));
   else if(phase==='ready'||phase==='pushing')body=e('div',null,
-    e('div',{style:{fontSize:12.5,color:'var(--muted)',marginBottom:8,lineHeight:1.45}},'This creates or updates the DRAFT pay run for '+fmtPeriodLabel(period.start,period.end)+'. Pushing again replaces the same draft — it never makes a second one. Xero works out tax and super.'),
-    tr('h',['Worker','Earnings','Deductions','Reimb.'],true),
+    e('div',{style:{fontSize:12.5,color:'var(--muted)',marginBottom:8,lineHeight:1.45}},'This creates or updates the DRAFT pay run for '+fmtPeriodLabel(period.start,period.end)+'. Pushing again replaces the same draft — it never makes a second one. PAYG below is myGang’s Tax Withholding % and is set on the Xero payslip as a manual adjustment; “Xero” means no % here, so Xero’s own tables apply. Super is Xero’s.'),
+    tr('h',['Worker','Earnings','PAYG','Deduct.'],true),
     (dry.workers||[]).map((w,i)=>{const L=w.lines||{};const ded=(L.DeductionLines||[]).reduce((s,l)=>s+l.Amount,0);const rb=(L.ReimbursementLines||[]).reduce((s,l)=>s+l.Amount,0);
-      return tr(i,[w.name+' → '+w.employee,money(L.expectedWages),ded?'-'+money(ded):'—',rb?money(rb):'—']);}),
+      const _pw=(payload.workers||[]).find(x=>x.name===w.name)||{};const _tx=(L.expectedTax!=null)?('-'+money(L.expectedTax)+(_pw.taxPct!=null?' ('+(_pw.taxMixed||_pw.taxPct)+'%)':'')):'Xero';
+      return tr(i,[w.name+' → '+w.employee,money(L.expectedWages),_tx,ded?'-'+money(ded):'—']);}),
+    (payload.workers||[]).some(x=>x.taxMixed)&&e('div',{style:{fontSize:11.5,color:'var(--amber)',marginTop:6}},'Mixed % this week (different % on different jobs, the higher is shown): '+(payload.workers||[]).filter(x=>x.taxMixed).map(x=>x.name+' '+x.taxMixed+'%').join(', ')+'. The dollar figure is the sum of each job’s slice, as on the Pay Week report.'),
     payload.skipped.length>0&&e('div',{style:{fontSize:11.5,color:'var(--dim)',marginTop:8}},'Not pushed: '+payload.skipped.map(s=>s.name+' ('+s.why+')').join('; ')),
     e('div',{style:{display:'flex',gap:8,marginTop:14}},
       e('button',{onClick:onClose,style:ghost,disabled:phase==='pushing'},'Cancel'),
@@ -4289,11 +4299,11 @@ function XeroPushModal({jobs,period,fq,onClose}){
     e('div',{style:{fontSize:11.5,color:'var(--muted)',marginBottom:8}},'Period '+res.period.start+' → '+res.period.end+(res.period.paymentDate?' · pays '+res.period.paymentDate:'')),
     tr('h',['Worker','Wages','Tax','Net'],true),
     (res.workers||[]).map((w,i)=>w.ok
-      ?tr(i,[w.name+(w.wagesMatch?'':' ⚠'),money(w.xero.wages),money(w.xero.tax),money(w.xero.netPay)])
+      ?tr(i,[w.name+((w.wagesMatch&&w.taxMatch!==false)?'':' ⚠'),money(w.xero.wages),money(w.xero.tax)+(w.expectedTax!=null?'':' (Xero)'),money(w.xero.netPay)])
       :tr(i,[w.name+' ✗','','',''])),
     (res.workers||[]).filter(w=>!w.ok||w.flag).map((w,i)=>e('div',{key:'f'+i,style:{fontSize:11.5,color:'#ef4444',marginTop:4}},w.name+': '+(w.error||w.flag))),
     tr('t',['Total',money(res.payRunTotals.wages),money(res.payRunTotals.tax),money(res.payRunTotals.netPay)],true),
-    e('div',{style:{fontSize:11.5,color:'var(--dim)',marginTop:10,lineHeight:1.45}},'Tax and super are Xero’s figures from each employee’s tax declaration and super setup. Open Xero → Payroll → Pay employees to review and post.'),
+    e('div',{style:{fontSize:11.5,color:'var(--dim)',marginTop:10,lineHeight:1.45}},'Tax marked (Xero) is from the employee’s tax declaration; the rest is myGang’s % applied as a manual PAYG adjustment on the payslip. Super is Xero’s. Open Xero → Payroll → Pay employees to review and post.'),
     e('div',{style:{display:'flex',gap:8,marginTop:14}},
       e('button',{onClick:onClose,style:ghost},'Close'),
       e('a',{href:'https://go.xero.com',target:'_blank',rel:'noopener',style:Object.assign({},btn,{textAlign:'center',textDecoration:'none'})},'Open Xero')));
